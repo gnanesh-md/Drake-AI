@@ -1,0 +1,20 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "C:\\Users\\HP\\Desktop\\Proj-GraphTrackerTiff-main\\python-multiline\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "1463026625a61edc72209a64edd79529d2f7d1b90583d78e76fa0d7f3136ee4f",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": true,
+  "wandb": true,
+  "vscode_msg": true
+}

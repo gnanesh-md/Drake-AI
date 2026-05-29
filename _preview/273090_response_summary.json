@@ -1,0 +1,31 @@
+{
+  "layout": {
+    "method": "density_fallback",
+    "confidence": 0.0,
+    "header_box": {
+      "x1": 0,
+      "y1": 0,
+      "x2": 1664,
+      "y2": 2450
+    },
+    "graph_box": {
+      "x1": 0,
+      "y1": 2450,
+      "x2": 1664,
+      "y2": 8665
+    },
+    "detections": []
+  },
+  "image_dimensions": {
+    "width": 1664,
+    "height": 6215
+  },
+  "graph_line_counts": {
+    "line_1": 1475,
+    "line_2": 4879
+  },
+  "depth_tick_count": 16,
+  "tiff_preprocessing": null,
+  "has_header_png": true,
+  "has_graph_png": true
+}
