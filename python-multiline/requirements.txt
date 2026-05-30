@@ -19,3 +19,4 @@ scikit-learn==1.5.2
 pydantic==2.9.2
 easyocr==1.7.1
 google-genai
+ollama

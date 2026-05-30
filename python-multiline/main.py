@@ -27,6 +27,8 @@ import re
 from pathlib import Path
 from boxRemoval import process_one_image
 from tiff_chunk_detect import process_tiff_bytes_for_backend, process_image_for_backend
+from header_ocr_engine import DEFAULT_MODEL as DEFAULT_HEADER_OCR_MODEL
+from header_ocr_engine import extract_header_text_with_ollama
 
 load_dotenv(".env")
 
@@ -38,9 +40,11 @@ YOLO_MODEL_PATH=os.getenv("YOLO_MODEL_PATH")
 GEMNI_KEY=os.getenv("GEMNI_KEY")
 OPENAI_KEY=os.getenv("OPENAI_KEY")
 TIFF_CHUNK_MODEL_PATH = os.getenv("TIFF_CHUNK_MODEL_PATH") or os.path.join("models", "best.pt")
+HEADER_OCR_MODEL = os.getenv("HEADER_OCR_MODEL") or DEFAULT_HEADER_OCR_MODEL
 
 # Pipeline mode: True = SVM+UNet, False = direct thresholding on cleaned image
 USE_UNET_PIPELINE = os.getenv("USE_UNET_PIPELINE", "true").lower() == "true"
+USE_EASYOCR_GPU = os.getenv("EASYOCR_GPU", "false").lower() == "true"
 
 # Load models on server startup
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -504,34 +508,95 @@ def convert_to_json_openai(ocr_text):
         print(f"[WARN] OpenAI API error ignored: {e}")
         return {}
 
-def extract_las_header(image):
-    try:
-        client = genai.Client(api_key=GEMNI_KEY)
-        byte_arr = io.BytesIO()
-        image_pil = Image.fromarray(image)
-        image_pil.save(byte_arr, format='JPEG')
-        image_bytes = byte_arr.getvalue()
+def get_ocr_reader():
+    global OCR_READER
+    if OCR_READER is None:
+        OCR_READER = easyocr.Reader(['en'], gpu=USE_EASYOCR_GPU and torch.cuda.is_available())
+    return OCR_READER
 
-        # Send the image and prompt to Gemini
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type='image/jpeg',
-                ),
-                WELL_LOG_HEADER_PROMPT
-            ]
+
+def extract_header_text_easyocr(image):
+    """Extract raw header text locally so header OCR works without API keys."""
+    try:
+        reader = get_ocr_reader()
+        results = reader.readtext(image, paragraph=True)
+        lines = []
+        for result in results:
+            if len(result) >= 2:
+                text = str(result[1]).strip()
+                if text:
+                    lines.append(text)
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[WARN] EasyOCR header extraction failed: {e}")
+        return ""
+
+
+def extract_las_header(image):
+    raw_text = ""
+    metadata = {
+        "engine": "none",
+        "model": None,
+        "strategy": None,
+        "status": "not_started",
+    }
+    try:
+        raw_text, metadata = extract_header_text_with_ollama(
+            image,
+            model_name=HEADER_OCR_MODEL,
         )
 
-        parsed_header = parse_well_log_ocr_to_las_header(response.text)
-        if parsed_header:
-            return parsed_header
+        if not raw_text and GEMNI_KEY:
+            client = genai.Client(api_key=GEMNI_KEY)
+            byte_arr = io.BytesIO()
+            image_pil = Image.fromarray(image)
+            image_pil.save(byte_arr, format='JPEG')
+            image_bytes = byte_arr.getvalue()
 
-        return convert_to_json_openai(response.text)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type='image/jpeg',
+                    ),
+                    WELL_LOG_HEADER_PROMPT
+                ]
+            )
+            raw_text = response.text or ""
+            metadata = {
+                "engine": "gemini",
+                "model": "gemini-2.5-flash",
+                "strategy": None,
+                "status": "success" if raw_text else "failed",
+            }
+
+        if not raw_text:
+            raw_text = extract_header_text_easyocr(image)
+            metadata = {
+                "engine": "easyocr",
+                "model": "easyocr.Reader(['en'])",
+                "strategy": None,
+                "status": "success" if raw_text else "failed",
+                "fallback_from": metadata,
+            }
+
+        parsed_header = parse_well_log_ocr_to_las_header(raw_text)
+        if not parsed_header and OPENAI_KEY and raw_text:
+            parsed_header = convert_to_json_openai(raw_text)
+
+        return parsed_header or {}, raw_text, metadata
     except Exception as e:
-        print(f"[WARN] Gemini API error ignored: {e}")
-        return {}
+        print(f"[WARN] Header OCR failed, falling back to EasyOCR: {e}")
+        raw_text = extract_header_text_easyocr(image)
+        parsed_header = parse_well_log_ocr_to_las_header(raw_text)
+        return parsed_header or {}, raw_text, {
+            "engine": "easyocr",
+            "model": "easyocr.Reader(['en'])",
+            "strategy": None,
+            "status": "success" if raw_text else "failed",
+            "error": str(e),
+        }
 
 
 def parse_well_log_ocr_to_las_header(ocr_text):
@@ -626,9 +691,8 @@ def extract_depth_ticks_ocr(graph_image):
     """
     global OCR_READER
     try:
-        if OCR_READER is None:
-            OCR_READER = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-        results = OCR_READER.readtext(graph_image)
+        reader = get_ocr_reader()
+        results = reader.readtext(graph_image)
         depth_ticks = []
         for (bbox, text, confidence) in results:
             cleaned = text.strip().replace(',', '').replace(' ', '')
@@ -844,15 +908,30 @@ def extract_header_info_and_graph_part(
     header_image = crop_box(img_cv2, layout["header_box"])
     body_image = crop_box(img_cv2, layout["graph_box"])
     las_header = {}
+    header_ocr_text = ""
+    header_ocr_metadata = {
+        "engine": "disabled",
+        "model": HEADER_OCR_MODEL,
+        "strategy": None,
+        "status": "disabled",
+    }
     if include_header_ocr:
         try:
-            las_header = extract_las_header(image=header_image)
+            las_header, header_ocr_text, header_ocr_metadata = extract_las_header(image=header_image)
         except Exception as e:
             print(f"[WARN] Header extraction failed, continuing with empty headers: {e}")
             las_header = {}
+            header_ocr_text = ""
+            header_ocr_metadata = {
+                "engine": "error",
+                "model": HEADER_OCR_MODEL,
+                "strategy": None,
+                "status": "failed",
+                "error": str(e),
+            }
 
     depth_ticks = extract_depth_ticks_ocr(body_image) if include_depth_ocr else []
-    return las_header, body_image, depth_ticks, layout
+    return las_header, header_ocr_text, header_ocr_metadata, body_image, depth_ticks, layout
 
 def rescale_pixel_data(points, current_bounds, target_bounds, debug=True):
     """
@@ -1009,6 +1088,153 @@ def create_las_with_dict(json_data, curves_dict, curve_metadata=None, depth_unit
     las.set_data(np.column_stack(data_cols))
     return las
 
+
+def _las_comment_lines(title, text):
+    border = "#" + "=" * 78
+    lines = [
+        border,
+        f"# {title}",
+        border,
+    ]
+    clean_text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not clean_text:
+        lines.append("# NO HEADER OCR TEXT AVAILABLE")
+    else:
+        for raw_line in clean_text.split("\n"):
+            line = raw_line.strip()
+            lines.append(f"# {line}" if line else "#")
+    lines.extend([
+        border,
+        "# END HEADER OCR EXTRACTION TEXT",
+        border,
+    ])
+    return lines
+
+
+def format_las_header_json_as_text(json_data):
+    lines = []
+    for section_key, section_title in (
+        ("las.version", "LAS VERSION"),
+        ("las.well", "LAS WELL HEADER"),
+    ):
+        items = (json_data or {}).get(section_key, [])
+        if not items:
+            continue
+        lines.append(section_title)
+        for item in items:
+            mnemonic = item.get("Mnemonic", "")
+            value = item.get("Value", "BLANK")
+            unit = item.get("Unit") or ""
+            description = item.get("Description") or ""
+            unit_text = f" {unit}" if unit else ""
+            desc_text = f" : {description}" if description else ""
+            lines.append(f"{mnemonic}: {value}{unit_text}{desc_text}")
+    return "\n".join(lines)
+
+
+def parse_header_key_values(header_text):
+    fields = {}
+    for raw_line in str(header_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        key = re.sub(r"[^A-Za-z0-9_]+", "_", key).upper().strip("_")
+        value = value.strip()
+        if key and value:
+            fields[key] = value
+    return fields
+
+
+def split_header_titles(value):
+    titles = []
+    for part in re.split(r"[,;/&]+|\s{2,}", str(value or "")):
+        clean = part.strip(" -")
+        if clean and clean.upper() not in {"BLANK", "N/A", "NA"}:
+            titles.append(clean.upper())
+    return titles
+
+
+def format_header_text_for_las(header_text):
+    fields = parse_header_key_values(header_text)
+    if not fields:
+        return str(header_text or "").strip()
+
+    lines = []
+    titles = []
+    for key in ("LOG_TYPE", "TYPE_LOG", "TYPE_LOG_RUN"):
+        titles.extend(split_header_titles(fields.get(key)))
+    seen_titles = set()
+    for title in titles:
+        if title not in seen_titles:
+            lines.append(title)
+            lines.append("")
+            seen_titles.add(title)
+
+    def add_field(label, key):
+        value = fields.get(key)
+        if value and value.upper() != "BLANK":
+            lines.append(f"{label}: {value}")
+
+    add_field("Company", "COMPANY")
+    add_field("Location", "LOCATION")
+    if lines and lines[-1] != "":
+        lines.append("")
+
+    add_field("Company", "COMPANY")
+    add_field("Well", "WELL")
+    add_field("Field", "FIELD")
+    add_field("County", "COUNTY")
+    add_field("State", "STATE")
+    if lines and lines[-1] != "":
+        lines.append("")
+
+    location_lines = []
+    api = fields.get("API")
+    if api and api.upper() != "BLANK":
+        location_lines.append(f"- API #: {api}")
+    location = fields.get("LOCATION")
+    if location and location.upper() != "BLANK":
+        location_lines.append(f"- {location}")
+    section_bits = []
+    for label, key in (("SEC", "SEC"), ("TWP", "TWP"), ("RGE", "RGE")):
+        value = fields.get(key)
+        if value and value.upper() != "BLANK":
+            section_bits.append(f"{label} {value}")
+    if section_bits:
+        location_lines.append(f"- {' '.join(section_bits)}")
+    if location_lines:
+        lines.append("Location:")
+        lines.extend(location_lines)
+        lines.append("")
+
+    add_field("Permanent Datum", "PERMANENT_DATUM")
+    add_field("Log Measured From", "LOG_MEASURED_FROM")
+    add_field("Drilling Measured From", "DRILLING_MEASURED_FROM")
+
+    extras = []
+    used_keys = {
+        "LOG_TYPE", "TYPE_LOG", "TYPE_LOG_RUN", "COMPANY", "LOCATION", "WELL",
+        "FIELD", "COUNTY", "STATE", "API", "SEC", "TWP", "RGE",
+        "PERMANENT_DATUM", "LOG_MEASURED_FROM", "DRILLING_MEASURED_FROM",
+    }
+    for key, value in fields.items():
+        if key not in used_keys and value and value.upper() != "BLANK":
+            label = key.replace("_", " ").title()
+            extras.append(f"{label}: {value}")
+    if extras:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.extend(extras)
+
+    return "\n".join(line for line in lines).strip()
+
+
+def prepend_las_header_comments(las_text, header_ocr_text=""):
+    comment_lines = []
+    comment_lines.extend(_las_comment_lines("HEADER OCR EXTRACTION TEXT", format_header_text_for_las(header_ocr_text)))
+    comment_lines.append("#")
+    return "\n".join(comment_lines) + "\n" + las_text
+
 @app.post("/segment-and-graph")
 async def segment_and_graph(
     file: UploadFile = File(...),
@@ -1037,7 +1263,7 @@ async def segment_and_graph(
             raise HTTPException(400, "manual_graph_box must be valid JSON")
 
     # GET HEADER AND GRAPH PART FROM WHOLE IMAGE
-    las_file_header, image_without_b, depth_ticks, layout_info = extract_header_info_and_graph_part(
+    las_file_header, header_ocr_text, header_ocr_metadata, image_without_b, depth_ticks, layout_info = extract_header_info_and_graph_part(
         img_cv2=img,
         model_path=YOLO_MODEL_PATH,
         include_header_ocr=include_header_ocr,
@@ -1087,6 +1313,8 @@ async def segment_and_graph(
         },
         "layout": layout_info,
         "las_headers": las_file_header,
+        "header_ocr_text": header_ocr_text,
+        "header_ocr": header_ocr_metadata,
         "depth_ticks": depth_ticks,
         "tiff_preprocessing": tiff_preprocessing_info
     })
@@ -1190,6 +1418,9 @@ async def generate_las(request: Request):
         curve_metadata = data_received.get("curve_metadata", {})
         depth_unit = data_received.get("depth_unit", "F")
         depth_step = data_received.get("depth_step", 0.5)
+        header_ocr_text = data_received.get("header_ocr_text", "")
+        if not str(header_ocr_text or "").strip():
+            header_ocr_text = format_las_header_json_as_text(las_file_header)
         # Rescale pixel data
         rescaled_data = {}
         for graph_name, graph in graph_info.items():
@@ -1222,7 +1453,12 @@ async def generate_las(request: Request):
         # Write LAS to memory
         buffer = io.StringIO()
         las.write(buffer)
-        las_content = buffer.getvalue().encode("utf-8")
+        las_text = buffer.getvalue()
+        las_text = prepend_las_header_comments(
+            las_text,
+            header_ocr_text=header_ocr_text,
+        )
+        las_content = las_text.encode("utf-8")
         base64_las = base64.b64encode(las_content).decode("utf-8")
 
         return JSONResponse(content={"las_file_base64": base64_las})

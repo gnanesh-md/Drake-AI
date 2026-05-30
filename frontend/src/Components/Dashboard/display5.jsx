@@ -3,6 +3,7 @@ import Navbar from "./navbar";
 import toast, { Toaster } from "react-hot-toast";
 import AITrackPrediction from "./AITrackPrediction";
 import SmartCursorViewer from "./SmartCursorViewer";
+import oilRefineryLoading from "../../assets/oil_refinery_loading_animation.svg";
 import {
   FiChevronDown,
   FiDownload,
@@ -48,6 +49,18 @@ const NEAR_POINT_MIN_DISTANCE_PX = 10;
 const DEFAULT_X_RANGE = [0, 100];
 const DEFAULT_Y_RANGE = [0, 12000];
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const OilRefineryLoader = ({ compact = false, overlay = false }) => (
+  <div className="flex flex-col items-center justify-center text-center">
+    <img
+      src={oilRefineryLoading}
+      alt="Loading"
+      className={compact ? "h-44 w-44 object-contain" : "h-72 w-72 object-contain"}
+    />
+    <p className={`mt-3 font-semibold ${overlay ? "text-white" : "text-slate-800"}`}>Processing image...</p>
+    <p className={`mt-1 text-sm ${overlay ? "text-white/80" : "text-slate-500"}`}>Extracting graph curves and header OCR.</p>
+  </div>
+);
 
 const getGraphLabel = (index) => {
   let label = "";
@@ -342,6 +355,7 @@ const Canvas = () => {
   const [zoom, setZoom] = useState(0.5);
   const [isPopupOpen, setIsPopupOpen] = useState(false);
   const [isExportPopupOpen, setIsExportPopupOpen] = useState(false);
+  const [isHeaderContentOpen, setIsHeaderContentOpen] = useState(false);
   const [imageName, setImageName] = useState("");
   const canvasRef = useRef(null);
   const [isInserting, setIsInserting] = useState(false);
@@ -368,6 +382,8 @@ const Canvas = () => {
     edge: null,
   });
   const [lasHeaders, setLasHeaders] = useState(null);
+  const [headerOcrText, setHeaderOcrText] = useState("");
+  const [headerOcrInfo, setHeaderOcrInfo] = useState(null);
   const uploadInputRef = useRef(null);
   const [leftPanelWidth, setLeftPanelWidth] = useState(250);
   const [rightPanelWidth, setRightPanelWidth] = useState(410);
@@ -409,6 +425,35 @@ const Canvas = () => {
       ),
     [sourceGraphLines, visibleGraphMap]
   );
+
+  const formatLasHeadersAsText = (headers) => {
+    const sections = [
+      ["las.version", "LAS VERSION"],
+      ["las.well", "LAS WELL HEADER"],
+    ];
+    return sections
+      .flatMap(([sectionKey, sectionTitle]) => {
+        const rows = headers?.[sectionKey] || [];
+        if (!rows.length) return [];
+        return [
+          sectionTitle,
+          ...rows.map((item) => {
+            const mnemonic = item?.Mnemonic || "";
+            const value = item?.Value ?? "BLANK";
+            const unit = item?.Unit ? ` ${item.Unit}` : "";
+            const description = item?.Description ? ` : ${item.Description}` : "";
+            return `${mnemonic}: ${value}${unit}${description}`;
+          }),
+        ];
+      })
+      .join("\n");
+  };
+
+  const completeHeaderText = useMemo(() => {
+    const rawText = String(headerOcrText || "").trim();
+    if (rawText) return rawText;
+    return formatLasHeadersAsText(lasHeaders);
+  }, [headerOcrText, lasHeaders]);
 
   const graphVisibilityCount = useMemo(
     () =>
@@ -473,6 +518,8 @@ const Canvas = () => {
     if (!file) return;
     setUploadedFile(file);
     setImageName(file.name);
+    setHeaderOcrText("");
+    setHeaderOcrInfo(null);
     // No image display or dimension logic here; only after backend processing
   };
 
@@ -487,6 +534,8 @@ const Canvas = () => {
     }
     setUploadedFile(file);
     setImageName(file.name);
+    setHeaderOcrText("");
+    setHeaderOcrInfo(null);
   };
 
   const openFilePicker = () => {
@@ -515,7 +564,7 @@ const Canvas = () => {
       formData.append("file", uploadedFile);
       formData.append("threshold", threshold);
       formData.append("total_graphs", numGraphs);
-      formData.append("include_header_ocr", "false");
+      formData.append("include_header_ocr", "true");
       formData.append("include_depth_ocr", "false");
       const response = await fetch(apiUrl, {
         method: "POST",
@@ -562,6 +611,8 @@ const Canvas = () => {
         setLasHeaders(data.las_headers);
         console.log("lasHeaders set:", data.las_headers);
       }
+      setHeaderOcrText(data.header_ocr_text || "");
+      setHeaderOcrInfo(data.header_ocr || null);
       setActiveViewTab("graph");
       setRightPanelTab("header");
       // Push initial history snapshot for undo/redo
@@ -973,10 +1024,15 @@ const Canvas = () => {
     }
 
     try {
+      if (!completeHeaderText.trim()) {
+        toast.error("No header OCR content found. Process the image again before exporting LAS.");
+        return;
+      }
       const imageBaseName = (imageName || "graph").replace(/\.[^/.]+$/, "");
       const payload = {
         graph_info,
         las_file_header: lasHeaders,
+        header_ocr_text: completeHeaderText,
       };
       console.log("PAYLOAD", payload);
 
@@ -1139,6 +1195,13 @@ const Canvas = () => {
           >
             <FiMenu size={22} />
           </button>
+          <button
+            type="button"
+            onClick={() => setIsHeaderContentOpen(true)}
+            className="h-10 rounded-md bg-blue-600 px-4 text-sm font-semibold text-white hover:bg-blue-700"
+          >
+            View Header OCR
+          </button>
         </div>
         <div className="flex min-w-[220px] items-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-2 shadow-sm">
           <div className="min-w-0">
@@ -1285,6 +1348,14 @@ const Canvas = () => {
             <div className="flex justify-between"><span className="text-slate-500">File Size</span><span>{imageFileSize}</span></div>
             <div className="flex justify-between"><span className="text-slate-500">Split</span><span>{layoutInfo?.method || "-"}</span></div>
           </div>
+          <button
+            type="button"
+            onClick={() => setIsHeaderContentOpen(true)}
+            className="mt-3 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-blue-600 font-semibold text-white hover:bg-blue-700"
+          >
+            <FiEye />
+            View Header OCR
+          </button>
           <button onClick={handleQuickExportLas} disabled={!hasGraphData} className="mt-3 flex h-11 w-full items-center justify-center gap-2 rounded-md border border-blue-600 bg-white font-semibold text-blue-600 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-45">
             <FiDownload />
             Export LAS
@@ -1322,6 +1393,16 @@ const Canvas = () => {
               Graph Bar {layoutInfo?.graph_box ? `Y ${Math.round(layoutInfo.graph_box.y1)}-${Math.round(layoutInfo.graph_box.y2)}` : ""}
             </button>
           </div>
+          <div className="mb-2 flex justify-end">
+            <button
+              type="button"
+              onClick={() => setIsHeaderContentOpen(true)}
+              className="inline-flex h-9 items-center gap-2 rounded-md bg-blue-600 px-4 text-sm font-semibold text-white hover:bg-blue-700"
+            >
+              <FiEye className="h-3.5 w-3.5" />
+              View Header OCR
+            </button>
+          </div>
 
           <div
             className="overflow-auto rounded-lg border border-slate-200 bg-white p-4 shadow-sm"
@@ -1329,11 +1410,7 @@ const Canvas = () => {
           >
             {isLoading && (
               <div className="grid h-full min-h-[520px] place-items-center text-slate-500">
-                <div className="text-center">
-                  <FiRefreshCw className="mx-auto mb-3 animate-spin text-blue-600" size={34} />
-                  <p className="font-semibold">Processing image...</p>
-                  <p className="mt-1 text-sm">Fast mode skips OCR and returns graph points first.</p>
-                </div>
+                <OilRefineryLoader compact />
               </div>
             )}
             {!isLoading && !imageUrl && (
@@ -1429,8 +1506,25 @@ const Canvas = () => {
           <section className="rounded-lg border border-slate-200 bg-white p-4">
             <div className="mb-3 flex items-center justify-between">
               <h3 className="text-sm font-bold">Header Information</h3>
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">OCR optional</span>
+              <span className="rounded-full bg-blue-50 px-3 py-1 text-xs text-blue-700">OCR enabled</span>
             </div>
+            {headerOcrInfo && (
+              <div className="mb-3 rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                OCR model: <span className="font-semibold">{headerOcrInfo.model || "unknown"}</span>
+                {headerOcrInfo.strategy ? <span> · Strategy: <span className="font-semibold">{headerOcrInfo.strategy}</span></span> : null}
+                {headerOcrInfo.engine ? <span> · Engine: <span className="font-semibold">{headerOcrInfo.engine}</span></span> : null}
+                {headerOcrInfo.recognized_field_count !== undefined ? <span> · Fields: <span className="font-semibold">{headerOcrInfo.recognized_field_count}</span></span> : null}
+                {headerOcrInfo.score !== undefined ? <span> · Score: <span className="font-semibold">{headerOcrInfo.score}</span></span> : null}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => setIsHeaderContentOpen(true)}
+              className="mb-3 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-blue-600 text-sm font-semibold text-white hover:bg-blue-700"
+            >
+              <FiEye />
+              View Header OCR
+            </button>
             <div className="space-y-3">
               {headerPreviewFields.map(([label, value]) => (
                 <div key={label} className="flex items-center justify-between gap-4 text-sm">
@@ -1439,13 +1533,58 @@ const Canvas = () => {
                 </div>
               ))}
             </div>
+            {completeHeaderText ? (
+              <div className="mt-4 rounded-md border border-slate-200 bg-slate-50 p-3">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <span className="text-xs font-semibold uppercase text-slate-500">Extracted Header Text</span>
+                  <button
+                    type="button"
+                    onClick={() => setIsHeaderContentOpen(true)}
+                    className="inline-flex h-7 items-center gap-1 rounded-md border border-blue-200 bg-white px-2 text-xs font-semibold text-blue-700 hover:bg-blue-50"
+                  >
+                    <FiEye className="h-3.5 w-3.5" />
+                    View complete
+                  </button>
+                </div>
+                <pre className="max-h-44 whitespace-pre-wrap break-words text-xs leading-5 text-slate-700">{completeHeaderText}</pre>
+              </div>
+            ) : (
+              <div className="mt-4 rounded-md border border-dashed border-slate-200 p-3 text-xs text-slate-500">
+                Header text extraction will appear here after processing.
+              </div>
+            )}
             <button
-              onClick={() => toast.success("Header editing will be enabled after OCR extraction is turned on.")}
+              onClick={() => toast.success("Header OCR text is now connected.")}
               className="mt-4 h-9 w-full rounded-md border border-blue-500 text-sm font-semibold text-blue-600 hover:bg-blue-50"
             >
               Edit Header Information
             </button>
           </section>
+          )}
+
+          {isHeaderContentOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-6">
+              <div className="flex max-h-[86vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+                <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900">Complete Header Extraction</h3>
+                    <p className="mt-1 text-xs text-slate-500">
+                      This same header content is included at the top of the exported LAS file.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsHeaderContentOpen(false)}
+                    className="grid h-8 w-8 place-items-center rounded-md border border-slate-200 text-slate-500 hover:bg-slate-50"
+                  >
+                    <FiX />
+                  </button>
+                </div>
+                <pre className="overflow-auto whitespace-pre-wrap break-words p-5 text-xs leading-6 text-slate-800">
+                  {completeHeaderText || "No header text extracted yet."}
+                </pre>
+              </div>
+            </div>
           )}
 
           {rightPanelTab === "summary" && (
@@ -1509,6 +1648,13 @@ const Canvas = () => {
           )}
         </aside>
       </main>
+      {isLoading && (
+        <div className="fixed inset-0 z-[60] grid place-items-center bg-slate-950/35 backdrop-blur-[2px]">
+          <div className="p-6">
+            <OilRefineryLoader overlay />
+          </div>
+        </div>
+      )}
     </div>
   );
 

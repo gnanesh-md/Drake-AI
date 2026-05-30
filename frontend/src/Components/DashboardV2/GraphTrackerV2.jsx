@@ -138,7 +138,62 @@ const gLabel = (i) => {
 const COLORS_NAMED = ["Red", "Green", "Blue", "Orange", "Purple", "Cyan", "Rose", "Lime"];
 const DEFAULT_Y_RANGE = [0, 12000];
 
+const formatLasHeadersAsText = (headers) => {
+  if (!headers || typeof headers !== "object") return "";
+  const lines = [];
+  Object.entries(headers).forEach(([section, items]) => {
+    if (!Array.isArray(items) || !items.length) return;
+    lines.push(section.replace(/^las\./i, "").toUpperCase());
+    items.forEach(item => {
+      const key = String(item?.Mnemonic || item?.mnemonic || "").trim();
+      const value = String(item?.Value || item?.value || "").trim();
+      const unit = String(item?.Unit || item?.unit || "").trim();
+      if (!key && !value) return;
+      lines.push(`${key}${unit ? ` (${unit})` : ""}: ${value || "-"}`);
+    });
+    lines.push("");
+  });
+  return lines.join("\n").trim();
+};
+
 /* ─── Modals ─────────────────────────────────────────────────────────────────── */
+function HeaderOcrModal({ open, text, accuracy, onTextChange, onClose, onSave }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 backdrop-blur-sm">
+      <div className="w-[760px] max-w-[92vw] max-h-[90vh] rounded-2xl bg-white shadow-2xl flex flex-col">
+        <div className="flex items-center justify-between border-b border-gray-100 px-6 py-4">
+          <div>
+            <h2 className="text-base font-bold text-gray-900">Header OCR Content</h2>
+            <p className="mt-0.5 text-[11px] font-medium text-gray-500">
+              Accuracy: <span className="text-blue-700">{accuracy}</span>
+            </p>
+          </div>
+          <button onClick={onClose} className="rounded-md p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700" title="Close">
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-6 py-5">
+          <textarea
+            value={text}
+            onChange={e => onTextChange(e.target.value)}
+            spellCheck={false}
+            className="min-h-[430px] w-full resize-y rounded-xl border border-gray-200 bg-gray-50 p-4 font-mono text-xs leading-5 text-gray-900 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            placeholder="Header OCR text will appear here. You can edit/correct it and save before LAS export."
+          />
+        </div>
+        <div className="flex items-center justify-between border-t border-gray-100 px-6 py-4">
+          <p className="text-[11px] font-medium text-gray-500">Saved content is exported at the top of the LAS file.</p>
+          <div className="flex items-center gap-2">
+            <button onClick={onClose} className="rounded-lg border border-gray-200 px-4 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-50">Cancel</button>
+            <button onClick={onSave} className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700">Save Header</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsModal({ onClose }) {
   const [numGraphs, setNumGraphs] = useState("2");
   const [threshold, setThreshold] = useState("0.5");
@@ -268,7 +323,8 @@ function HelpModal({ onClose }) {
 
 /* ─── Main Component ─────────────────────────────────────────────────────────── */
 export default function GraphTrackerV2() {
-    const [showExport, setShowExport] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [showHeaderOcrModal, setShowHeaderOcrModal] = useState(false);
   /* ── File & Image ── */
   const [uploadedFile, setUploadedFile] = useState(null);
   const [imageUrl, setImageUrl] = useState(null);
@@ -352,6 +408,10 @@ export default function GraphTrackerV2() {
   const [headerImageUrl, setHeaderImageUrl] = useState(null);
   const [layoutInfo, setLayoutInfo] = useState(null);
   const [lasHeaders, setLasHeaders] = useState(null);
+  const [headerOcrText, setHeaderOcrText] = useState("");
+  const [headerOcrInfo, setHeaderOcrInfo] = useState(null);
+  const [editableHeaderText, setEditableHeaderText] = useState("");
+  const [savedHeaderText, setSavedHeaderText] = useState("");
   const [activeViewTab, setActiveViewTab] = useState("graph");
   const [rightPanelTab, setRightPanelTab] = useState("header");
 
@@ -404,6 +464,30 @@ export default function GraphTrackerV2() {
       ["Date", pick(["DATE"])],
     ];
   }, [lasHeaders]);
+
+  const completeHeaderText = useMemo(() => (
+    savedHeaderText || headerOcrText || formatLasHeadersAsText(lasHeaders)
+  ), [savedHeaderText, headerOcrText, lasHeaders]);
+
+  const headerAccuracyLabel = useMemo(() => {
+    if (!headerOcrInfo) return "Not available";
+    const rawScore = Number(headerOcrInfo.score ?? headerOcrInfo.confidence ?? headerOcrInfo.accuracy);
+    if (Number.isFinite(rawScore)) {
+      const pct = rawScore <= 1 ? rawScore * 100 : rawScore;
+      return `${Math.round(pct)}%`;
+    }
+    const recognized = Number(headerOcrInfo.recognized_field_count);
+    const total = Number(headerOcrInfo.nonblank_field_count || headerOcrInfo.total_field_count);
+    if (Number.isFinite(recognized) && Number.isFinite(total) && total > 0) {
+      return `${Math.round((recognized / total) * 100)}%`;
+    }
+    return "Not available";
+  }, [headerOcrInfo]);
+
+  const openHeaderOcrViewer = () => {
+    setEditableHeaderText(completeHeaderText || "");
+    setShowHeaderOcrModal(true);
+  };
 
   const graphSummaryItems = useMemo(() =>
     sourceGraphLines.map((line, idx) => ({
@@ -556,6 +640,10 @@ export default function GraphTrackerV2() {
       setHeaderImageUrl(null);
       setLayoutInfo(null);
       setLasHeaders(null);
+      setHeaderOcrText("");
+      setHeaderOcrInfo(null);
+      setEditableHeaderText("");
+      setSavedHeaderText("");
       setActiveViewTab("graph");
       setRightPanelTab("header");
       setSourceGraphLines([]);
@@ -618,6 +706,11 @@ export default function GraphTrackerV2() {
       if (data.header_png_base64) setHeaderImageUrl(`data:image/png;base64,${data.header_png_base64}`);
       if (data.layout) setLayoutInfo(data.layout);
       if (data.las_headers) setLasHeaders(data.las_headers);
+      const extractedHeaderText = data.header_ocr_text || formatLasHeadersAsText(data.las_headers);
+      setHeaderOcrText(extractedHeaderText || "");
+      setHeaderOcrInfo(data.header_ocr || null);
+      setEditableHeaderText(extractedHeaderText || "");
+      setSavedHeaderText("");
       setActiveViewTab("graph");
       setRightPanelTab("header");
       setTrackingGraph(null);
@@ -925,6 +1018,7 @@ export default function GraphTrackerV2() {
         body: JSON.stringify({
           graph_info: graphInfo,
           las_file_header: lasHeaders || {},
+          header_ocr_text: completeHeaderText || "",
           curve_metadata: curveMetadata,
           depth_unit: editedBounds[0]?.depthUnit || "F",
           depth_step: editedBounds[0]?.depthStep || 0.5,
@@ -965,6 +1059,19 @@ export default function GraphTrackerV2() {
       {/* MODALS */}
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+      <HeaderOcrModal
+        open={showHeaderOcrModal}
+        text={editableHeaderText}
+        accuracy={headerAccuracyLabel}
+        onTextChange={setEditableHeaderText}
+        onClose={() => setShowHeaderOcrModal(false)}
+        onSave={() => {
+          setSavedHeaderText(editableHeaderText.trim());
+          setHeaderOcrText(editableHeaderText.trim());
+          setShowHeaderOcrModal(false);
+          toast.success("Header OCR content saved for LAS export.");
+        }}
+      />
 
       {/* ══ TOP BAR ══════════════════════════════════════════════════════════════ */}
       <div className="h-11 border-b border-gray-200 bg-white flex items-center justify-between px-4 shrink-0 z-10">
@@ -1344,6 +1451,23 @@ export default function GraphTrackerV2() {
                       Header OCR preview will appear here after detection.
                     </div>
                   )}
+                </div>
+
+                <div className="rounded-lg border border-blue-100 bg-blue-50 p-2.5">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-blue-700">Header OCR</span>
+                    <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-blue-700">
+                      {headerAccuracyLabel}
+                    </span>
+                  </div>
+                  <button
+                    onClick={openHeaderOcrViewer}
+                    className="w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-bold text-white shadow-sm hover:bg-blue-700">
+                    View / Edit Header Content
+                  </button>
+                  <p className="mt-1.5 text-[10px] font-medium text-blue-700">
+                    {savedHeaderText ? "Saved header text will be used in LAS export." : "Open to verify OCR text before LAS export."}
+                  </p>
                 </div>
 
                 <div className="space-y-1.5">
