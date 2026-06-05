@@ -5,7 +5,7 @@ export function NavigationBar() {
     <div className="flex justify-between items-center px-20 py-3 text-base leading-none bg-blend-normal bg-neutral-900 max-md:px-5">
       {/* Logo Section */}
       <a href="/" className="text-3xl font-bold tracking-widest leading-none uppercase bg-clip-text bg-gradient-to-r from-[#9B51E0] to-[#3081ED] text-transparent white">
-        Graph TRACKER
+        Well Log Digitization
       </a>
 
       {/* Center Links */}

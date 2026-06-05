@@ -89,7 +89,7 @@ export function SignUp() {
                 <a href="/login" className="font-medium">Sign in!</a>
               </div>
               <div className="mt-14 ml-12 text-2xl font-semibold leading-10 max-md:mt-10 max-md:ml-2.5">
-                Get Started With Graph Tracker
+                Get Started With Well Log Digitization
               </div>
               <div className="self-center text-base leading-none text-zinc-500">
                 Getting started is easy

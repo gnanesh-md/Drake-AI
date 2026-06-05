@@ -5,7 +5,7 @@ export function HeroSection() {
     <div className="flex overflow-hidden flex-col px-20 pt-5 pb-60 bg-neutral-800 max-md:px-5 max-md:pb-24">
       <div className="flex flex-wrap gap-5 justify-between items-center w-full text-xs font-medium tracking-widest leading-6 uppercase max-md:max-w-full">
         <div className="self-stretch my-auto text-3xl font-bold leading-none bg-clip-text bg-gradient-to-r from-[#9B51E0] to-[#3081ED] text-transparent">
-          GRAPH TRACKER
+          Well Log Digitization
         </div>
         <div className="flex gap-8 self-stretch my-auto">
           {/* <div className="grow font-bold bg-clip-text bg-gradient-to-r from-[#9B51E0] to-[#3081ED] text-transparent">
@@ -32,7 +32,7 @@ export function HeroSection() {
                 PRECISION
               </div>
               <div className="mt-28 text-2xl tracking-wide leading-9 text-neutral-200 max-md:mt-10 max-md:max-w-full">
-                Convert complex graphs into editable, searchable data with our Graph Tracker.
+                Convert complex graphs into editable, searchable data with Well Log Digitization.
                 Seamlessly extract information from images and streamline your workflow.
               </div>
             </div>

@@ -49,7 +49,7 @@ export function Login() {
           <div className="flex flex-col mt-10 w-full max-md:max-w-full">
             <div className="flex flex-wrap gap-5 justify-between w-full text-black max-md:max-w-full">
               <div className="text-lg font-medium leading-10">
-                Graph Tracker</div>
+                Well Log Digitization</div>
               <div className="flex gap-2 my-auto text-sm leading-none">
                 <div className="grow font-light">Don’t have an account?</div>
                 <a href="/signup" className="font-medium">Sign up!</a>

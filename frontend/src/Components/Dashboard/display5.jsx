@@ -23,11 +23,11 @@ import {
 
 const apiUrl =
   import.meta.env.VITE_GRAPH_API_URL ||
-  "https://python-curvetracking.thedrake.ai/segment-and-graph";
+  "/segment-and-graph";
 const lasApiUrl =
   import.meta.env.VITE_GRAPH_LAS ||
   import.meta.env.VITE_GRAPH_Las ||
-  "https://python-curvetracking.thedrake.ai/generate-las-base64";
+  "/generate-las-base64";
 const GRAPH_COLORS = [
   "#FF0000",
   "#00FF00",
@@ -48,6 +48,32 @@ const BOUNDARY_EDGE_HIT_TOLERANCE_PX = 8;
 const NEAR_POINT_MIN_DISTANCE_PX = 10;
 const DEFAULT_X_RANGE = [0, 100];
 const DEFAULT_Y_RANGE = [0, 12000];
+const WELL_FIELDS = [
+  { key: "COMP", label: "Company" },
+  { key: "WELL", label: "Well Name" },
+  { key: "FLD", label: "Field" },
+  { key: "LOC", label: "Location" },
+  { key: "CNTY", label: "County" },
+  { key: "STAT", label: "State" },
+  { key: "CTRY", label: "Country" },
+  { key: "SRVC", label: "Service Co." },
+  { key: "DATE", label: "Date" },
+  { key: "API", label: "API Number" },
+];
+const CURVE_UNIT_SUGGESTIONS = {
+  GR: "GAPI",
+  HCAL: "IN",
+  BMNO: "OHMM",
+  BMIN: "OHMM",
+  TENS: "LBF",
+  RT: "OHMM",
+  RXO: "OHMM",
+  SP: "MV",
+  RHOB: "G/C3",
+  NPHI: "V/V",
+  DT: "US/FT",
+  CALI: "IN",
+};
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const OilRefineryLoader = ({ compact = false, overlay = false }) => (
@@ -253,7 +279,7 @@ function HelpModal({ onClose }) {
           </div>
           <div className="bg-blue-50 rounded-xl p-4">
             <h4 className="text-sm font-semibold text-blue-900 mb-1">Curve Tracking</h4>
-            <p className="text-xs text-blue-700 leading-relaxed">Upload a TIFF, enter the number of graphs, then click <strong>Submit</strong>. The AI backend will automatically trace the curves and render them on the canvas.</p>
+            <p className="text-xs text-blue-700 leading-relaxed">Upload a TIFF, enter the number of curves, then click <strong>Submit</strong>. The AI backend will automatically trace the curves and render them on the canvas.</p>
           </div>
           <div className="flex justify-end">
             <button onClick={onClose} className="px-4 py-2 bg-gray-900 text-white text-xs font-semibold rounded-lg hover:bg-gray-800">Close</button>
@@ -382,6 +408,8 @@ const Canvas = () => {
     edge: null,
   });
   const [lasHeaders, setLasHeaders] = useState(null);
+  const [curveMetadata, setCurveMetadata] = useState([]);
+  const [wellHeaderOverrides, setWellHeaderOverrides] = useState({});
   const [headerOcrText, setHeaderOcrText] = useState("");
   const [headerOcrInfo, setHeaderOcrInfo] = useState(null);
   const uploadInputRef = useRef(null);
@@ -452,8 +480,8 @@ const Canvas = () => {
   const completeHeaderText = useMemo(() => {
     const rawText = String(headerOcrText || "").trim();
     if (rawText) return rawText;
-    return formatLasHeadersAsText(lasHeaders);
-  }, [headerOcrText, lasHeaders]);
+    return "";
+  }, [headerOcrText]);
 
   const graphVisibilityCount = useMemo(
     () =>
@@ -491,6 +519,31 @@ const Canvas = () => {
         ? "Uploaded Successfully"
         : "No File Uploaded";
   const hasGraphData = sourceGraphLines.some((line) => line && line.length > 0);
+
+  useEffect(() => {
+    setCurveMetadata((prev) =>
+      sourceGraphLines.map((_, idx) => {
+        const label = getGraphLabel(idx);
+        return {
+          mnemonic: prev[idx]?.mnemonic ?? label,
+          unit: prev[idx]?.unit ?? "",
+          description: prev[idx]?.description ?? `Graph ${label} curve`,
+        };
+      })
+    );
+  }, [sourceGraphLines.length]);
+
+  useEffect(() => {
+    if (!lasHeaders) return;
+    const preFilled = {};
+    (lasHeaders["las.well"] || []).forEach((item) => {
+      const mnemonic = String(item?.Mnemonic || "").toUpperCase();
+      if (WELL_FIELDS.some(({ key }) => key === mnemonic)) {
+        preFilled[mnemonic] = item?.Value || "";
+      }
+    });
+    setWellHeaderOverrides((prev) => ({ ...preFilled, ...prev }));
+  }, [lasHeaders]);
 
   const resetLayout = () => {
     setLeftPanelWidth(250);
@@ -555,7 +608,7 @@ const Canvas = () => {
       return;
     }
     if (!numGraphs) {
-      toast.error("Please enter the number of graphs.");
+      toast.error("Please enter the number of curves.");
       return;
     }
     setIsLoading(true);
@@ -1011,6 +1064,59 @@ const Canvas = () => {
     return new Blob([byteArray], { type: mimeType });
   }
 
+  const updateCurveMetadata = (idx, field, value) => {
+    setCurveMetadata((prev) => {
+      const arr = [...prev];
+      const current = arr[idx] || {};
+      const next = { ...current, [field]: value };
+      if (field === "mnemonic") {
+        const suggestion = CURVE_UNIT_SUGGESTIONS[String(value || "").trim().toUpperCase()];
+        if (suggestion && !current.unit) {
+          next.unit = suggestion;
+        }
+      }
+      arr[idx] = next;
+      return arr;
+    });
+  };
+
+  const buildCurveMetadataPayload = (graphInfo) => {
+    const payload = {};
+    sourceGraphLines.forEach((_, idx) => {
+      const label = getGraphLabel(idx);
+      const graph = graphInfo?.[`graph_${label}`];
+      if (!graph?.lines?.[label]) return;
+      payload[label] = {
+        mnemonic: curveMetadata[idx]?.mnemonic || label,
+        unit: curveMetadata[idx]?.unit || "NONE",
+        description: curveMetadata[idx]?.description || `Graph ${label} curve`,
+      };
+    });
+    return payload;
+  };
+
+  const buildLasHeadersWithOverrides = (headers = {}) => {
+    const existingWell = headers?.["las.well"] || [];
+    const existingByMnemonic = Object.fromEntries(
+      existingWell.map((item) => [String(item?.Mnemonic || "").toUpperCase(), item])
+    );
+    const wellRows = WELL_FIELDS.map(({ key, label }) => ({
+      Mnemonic: key,
+      Value: wellHeaderOverrides[key] || "",
+      Unit: existingByMnemonic[key]?.Unit || "",
+      Description: existingByMnemonic[key]?.Description || label,
+    }));
+    const extraRows = existingWell.filter((item) => {
+      const mnemonic = String(item?.Mnemonic || "").toUpperCase();
+      return mnemonic && !WELL_FIELDS.some(({ key }) => key === mnemonic);
+    });
+
+    return {
+      ...(headers || {}),
+      "las.well": [...wellRows, ...extraRows],
+    };
+  };
+
   const handleExportPoints = async (graph_info, lasHeaders) => {
     console.log("graph_info in handleExportPoints:", graph_info);
 
@@ -1025,14 +1131,16 @@ const Canvas = () => {
 
     try {
       if (!completeHeaderText.trim()) {
-        toast.error("No header OCR content found. Process the image again before exporting LAS.");
-        return;
+        toast("Header OCR was empty. Using manually entered header fields.", { icon: "!" });
       }
       const imageBaseName = (imageName || "graph").replace(/\.[^/.]+$/, "");
       const payload = {
         graph_info,
         las_file_header: lasHeaders,
         header_ocr_text: completeHeaderText,
+        curve_metadata: buildCurveMetadataPayload(graph_info),
+        depth_unit: "FT",
+        depth_step: 0.5,
       };
       console.log("PAYLOAD", payload);
 
@@ -1102,7 +1210,7 @@ const Canvas = () => {
       toast.error("Process an image before exporting LAS.");
       return;
     }
-    handleExportPoints(graphInfo, lasHeaders || {});
+    setIsExportPopupOpen(true);
   };
 
   const requireProcessedImage = () => {
@@ -1321,13 +1429,13 @@ const Canvas = () => {
           </div>
 
           <form onSubmit={handleSubmit} className="mt-5 rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-3">
-            <label className="block text-sm font-bold text-slate-900">Graphs Detected</label>
+            <label className="block text-sm font-bold text-slate-900">Curves Detected</label>
             <input
               type="number"
               value={numGraphs}
               onChange={(e) => setNumGraphs(e.target.value)}
               className="h-11 w-full rounded-md border border-slate-200 px-3 text-sm outline-none focus:border-blue-500"
-              placeholder="Enter number of graphs"
+              placeholder="Enter number of curves"
               min={1}
               required
             />
@@ -1708,10 +1816,10 @@ const Canvas = () => {
               onChange={handleImageUpload}
             />
           </span>
-          {/* Total Graphs input section */}
+          {/* Total Curves input section */}
           <div className="bg-gray-800 p-6 rounded-lg shadow-lg mt-8 w-full max-w-xs sm:max-w-sm mx-auto flex flex-col items-center">
             <h2 className="text-2xl text-white font-bold mb-6 tracking-wide text-center">
-              Total Graphs
+              Total Curves
             </h2>
             <form
               onSubmit={handleSubmit}
@@ -1722,7 +1830,7 @@ const Canvas = () => {
                 value={numGraphs}
                 onChange={(e) => setNumGraphs(e.target.value)}
                 className="w-full p-3 rounded-lg bg-gray-700 text-white text-lg mb-2 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Enter number of graphs"
+                placeholder="Enter number of curves"
                 min={1}
                 required
               />
@@ -1853,7 +1961,7 @@ const Canvas = () => {
                       </span>{" "}
                       and{" "}
                       <span className="font-semibold text-blue-400">
-                        enter the number of graphs
+                        enter the number of curves
                       </span>{" "}
                       to process the image...
                     </span>
@@ -2271,6 +2379,44 @@ const Canvas = () => {
                       </div>
 
                       <div className="px-4 py-3 space-y-3">
+                        {/* Curve metadata */}
+                        <div>
+                          <label className="text-xs text-gray-500 font-medium uppercase tracking-wide mb-2 block">Curve Metadata</label>
+                          <div className="grid grid-cols-3 gap-3">
+                            <div>
+                              <label className="text-xs text-gray-400 mb-1 block">Mnemonic</label>
+                              <input
+                                type="text"
+                                placeholder="GR"
+                                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm uppercase focus:outline-none focus:ring-2 focus:ring-blue-400"
+                                value={curveMetadata[idx]?.mnemonic || ""}
+                                onChange={(e) => updateCurveMetadata(idx, "mnemonic", e.target.value.toUpperCase())}
+                              />
+                            </div>
+                            <div>
+                              <label className="text-xs text-gray-400 mb-1 block">Unit</label>
+                              <input
+                                type="text"
+                                placeholder="GAPI"
+                                list="curve-unit-suggestions"
+                                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm uppercase focus:outline-none focus:ring-2 focus:ring-blue-400"
+                                value={curveMetadata[idx]?.unit || ""}
+                                onChange={(e) => updateCurveMetadata(idx, "unit", e.target.value.toUpperCase())}
+                              />
+                            </div>
+                            <div>
+                              <label className="text-xs text-gray-400 mb-1 block">Description</label>
+                              <input
+                                type="text"
+                                placeholder="Gamma Ray"
+                                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                                value={curveMetadata[idx]?.description || ""}
+                                onChange={(e) => updateCurveMetadata(idx, "description", e.target.value)}
+                              />
+                            </div>
+                          </div>
+                        </div>
+
                         {/* X Range */}
                         <div>
                           <label className="text-xs text-gray-500 font-medium uppercase tracking-wide mb-2 block">X Range (value axis)</label>
@@ -2327,6 +2473,35 @@ const Canvas = () => {
                 </div>
               )}
 
+              <datalist id="curve-unit-suggestions">
+                {Array.from(new Set(Object.values(CURVE_UNIT_SUGGESTIONS))).map((unit) => (
+                  <option key={unit} value={unit} />
+                ))}
+              </datalist>
+
+              {/* Manual well header fields */}
+              <div className="bg-gray-50 rounded-xl p-4">
+                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-3">Well Header</label>
+                <div className="grid grid-cols-2 gap-3">
+                  {WELL_FIELDS.map(({ key, label }) => (
+                    <div key={key}>
+                      <label className="text-xs text-gray-500 mb-1 block">{label}</label>
+                      <input
+                        type="text"
+                        className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                        value={wellHeaderOverrides[key] || ""}
+                        onChange={(e) =>
+                          setWellHeaderOverrides((prev) => ({
+                            ...prev,
+                            [key]: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
               {/* Action buttons */}
               <div className="flex justify-end gap-3 pt-2 border-t border-gray-100">
               <button
@@ -2354,9 +2529,22 @@ const Canvas = () => {
                     }
 
                     sourceGraphLines.forEach((line, idx) => {
+                      const boundary = normalizeBoundary(
+                        graphBoundaryView[idx] ||
+                          graphBoundaries[idx] ||
+                          getLineBoundary(line, imageDimensions.width, imageDimensions.height),
+                        imageDimensions.width,
+                        imageDimensions.height
+                      );
                       const cleanedLine = dedupeLinePoints(line, {
                         minDistance: nearPointMinDistance,
-                      });
+                      }).filter(
+                        ([x, y]) =>
+                          x >= boundary.left &&
+                          x <= boundary.right &&
+                          y >= boundary.top &&
+                          y <= boundary.bottom
+                      );
                       if (!cleanedLine || cleanedLine.length === 0) return;
                       const graphLabel = getGraphLabel(idx);
                       const graphKey = `graph_${graphLabel}`;
@@ -2377,6 +2565,12 @@ const Canvas = () => {
                       graph_info[graphKey] = {
                         x_range: [xMin, xMax],
                         y_range: [sharedYMin, sharedYMax],
+                        pixel_bounds: [
+                          boundary.left,
+                          boundary.top,
+                          boundary.right,
+                          boundary.bottom,
+                        ],
                         lines: {
                           [graphLabel]: cleanedLine,
                         },
@@ -2387,7 +2581,7 @@ const Canvas = () => {
                       return;
                     }
                     console.log("graph_info", graph_info);
-                    handleExportPoints(graph_info, lasHeaders);
+                    handleExportPoints(graph_info, buildLasHeadersWithOverrides(lasHeaders));
                     toggleExportPopup();
                   } catch (err) {
                     toast.error(
