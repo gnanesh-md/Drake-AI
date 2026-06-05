@@ -12,11 +12,11 @@ except Exception:
 
 
 MIN_DIM = 800
-DEFAULT_MODEL = "qwen2.5vl:32b"
+DEFAULT_MODEL = "qwen2.5vl:7b"
 MODEL_OPTIONS = {
-    "temperature": 0,
-    "num_ctx": 8192,
-    "num_predict": 4096,
+  "temperature": 0,
+    "num_ctx": 4096,
+    "num_predict": 2048,
 }
 
 
@@ -120,10 +120,7 @@ def strategy_denoised(img: Image.Image) -> Image.Image:
 
 STRATEGIES = [
     ("Original", strategy_original),
-    ("Mild Enhancement", strategy_mild_enhance),
     ("Grayscale Boost", strategy_grayscale_boost),
-    ("Adaptive Threshold", strategy_adaptive_threshold),
-    ("Denoise + Enhance", strategy_denoised),
 ]
 
 

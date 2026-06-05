@@ -4,6 +4,7 @@ import pickle
 import cv2
 import numpy as np
 import torch
+import tempfile
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
@@ -29,6 +30,8 @@ from boxRemoval import process_one_image
 from tiff_chunk_detect import process_tiff_bytes_for_backend, process_image_for_backend
 from header_ocr_engine import DEFAULT_MODEL as DEFAULT_HEADER_OCR_MODEL
 from header_ocr_engine import extract_header_text_with_ollama
+from curve_value_matcher import CurveValueMatcher, create_curve_info
+from graph_vision_analyzer import GraphVisionAnalyzer
 
 load_dotenv(".env")
 
@@ -39,11 +42,13 @@ app = FastAPI()
 YOLO_MODEL_PATH=os.getenv("YOLO_MODEL_PATH")
 GEMNI_KEY=os.getenv("GEMNI_KEY")
 OPENAI_KEY=os.getenv("OPENAI_KEY")
-TIFF_CHUNK_MODEL_PATH = os.getenv("TIFF_CHUNK_MODEL_PATH") or os.path.join("models", "best.pt")
+TIFF_CHUNK_MODEL_PATH = os.getenv("TIFF_CHUNK_MODEL_PATH") or "best.pt"
 HEADER_OCR_MODEL = os.getenv("HEADER_OCR_MODEL") or DEFAULT_HEADER_OCR_MODEL
 
-# Pipeline mode: True = SVM+UNet, False = direct thresholding on cleaned image
-USE_UNET_PIPELINE = os.getenv("USE_UNET_PIPELINE", "true").lower() == "true"
+# Pipeline mode: True = SVM+UNet, False = direct thresholding on cleaned image.
+# The checked-in model files may be Git LFS pointers, so default to the
+# deterministic tracker unless real weights are explicitly configured.
+USE_UNET_PIPELINE = os.getenv("USE_UNET_PIPELINE", "false").lower() == "true"
 USE_EASYOCR_GPU = os.getenv("EASYOCR_GPU", "false").lower() == "true"
 
 # Load models on server startup
@@ -76,6 +81,140 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[ERROR] Unhandled request error on {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+class KalmanCurveTracker:
+    """
+    1D Kalman filter for row-by-row curve tracking.
+    State is x-position and x-velocity while y increases.
+    """
+    def __init__(self, initial_x: float, process_noise: float = 18.0, measurement_noise: float = 5.0):
+        self.kf = cv2.KalmanFilter(2, 1)
+        self.kf.transitionMatrix = np.array([[1, 1], [0, 1]], dtype=np.float32)
+        self.kf.measurementMatrix = np.array([[1, 0]], dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(2, dtype=np.float32) * process_noise
+        self.kf.measurementNoiseCov = np.array([[measurement_noise]], dtype=np.float32)
+        self.kf.errorCovPost = np.eye(2, dtype=np.float32)
+        self.kf.statePost = np.array([[initial_x], [0.0]], dtype=np.float32)
+        self.last_seen = 0
+        self.max_gap = 120
+
+    def predict(self) -> float:
+        prediction = self.kf.predict()
+        self.last_seen += 1
+        return float(prediction[0])
+
+    def update(self, measured_x: float) -> float:
+        self.last_seen = 0
+        corrected = self.kf.correct(np.array([[measured_x]], dtype=np.float32))
+        return float(corrected[0])
+
+    @property
+    def is_lost(self) -> bool:
+        return self.last_seen > self.max_gap
+
+
+def separate_color_curves(bgr_image):
+    """
+    Separate red, green, and dark curve pixels with adaptive saturation.
+    """
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+    _, saturation, value = cv2.split(hsv)
+
+    non_white_saturation = saturation[value < 200]
+    if non_white_saturation.size > 100:
+        adaptive_s_min = max(25, int(np.percentile(non_white_saturation, 15)))
+    else:
+        adaptive_s_min = 35
+
+    print(f"[INFO] Color separation: adaptive S_min = {adaptive_s_min}")
+
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(
+            hsv,
+            np.array([0, adaptive_s_min, 40]),
+            np.array([12, 255, 255]),
+        ),
+        cv2.inRange(
+            hsv,
+            np.array([163, adaptive_s_min, 40]),
+            np.array([180, 255, 255]),
+        ),
+    )
+    green_mask = cv2.inRange(
+        hsv,
+        np.array([32, adaptive_s_min, 35]),
+        np.array([98, 255, 255]),
+    )
+    black_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, 0]),
+        np.array([180, 80, 80]),
+    )
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return {
+        "red": cv2.dilate(red_mask, kernel, iterations=1),
+        "green": cv2.dilate(green_mask, kernel, iterations=1),
+        "black": cv2.dilate(black_mask, kernel, iterations=1),
+    }
+
+
+def merge_color_masks(color_masks):
+    """Merge binary color masks into one mask."""
+    masks = list(color_masks.values())
+    if not masks:
+        raise ValueError("No color masks to merge")
+    combined = np.zeros_like(masks[0])
+    for mask in masks:
+        combined = cv2.bitwise_or(combined, mask)
+    return combined
+
+
+def prepare_color_curve_mask(mask, dash_bridge_px=16):
+    """Clean one color channel while preserving dashed curve fragments."""
+    if cv2.countNonZero(mask) == 0:
+        return mask
+
+    small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    closed_small = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, small_kernel, iterations=1)
+
+    dash_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dash_bridge_px, 1))
+    closed_dash = cv2.morphologyEx(closed_small, cv2.MORPH_CLOSE, dash_kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed_dash, connectivity=8)
+    keep = np.zeros(num_labels, dtype=np.uint8)
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        height = stats[label, cv2.CC_STAT_HEIGHT]
+        long_side = max(width, height)
+        short_side = max(1, min(width, height))
+        aspect_ratio = long_side / short_side
+        if area >= 6 or (aspect_ratio > 2.0 and long_side >= 8):
+            keep[label] = 255
+
+    result = keep[labels]
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 1))
+    eroded = cv2.erode(result, erode_kernel, iterations=1)
+    if cv2.countNonZero(eroded) < 10:
+        return result
+    return eroded
+
+
+def apply_clahe(bgr_image):
+    """Improve local contrast for faded or unevenly lit TIF scans."""
+    lab = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l_channel)
+    enhanced_lab = cv2.merge([l_enhanced, a_channel, b_channel])
+    return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+
 
 def extract_features(patch):
     if len(patch.shape) == 3:
@@ -164,39 +303,40 @@ def patchify(img, patch_size):
     return patches, H, W, pad_h, pad_w, patch_positions
 
 def refine_mask(image):
-    # Read the image in grayscale
+    """
+    Remove noise while preserving dashed curves and thin curve fragments.
+    """
     _, thresh = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY)
-
-    # Find contours
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Print area of each contour
-    # Calculate area of each contour and total area
+    if not contours:
+        return image
+
     areas = [cv2.contourArea(contour) for contour in contours]
     total_area = sum(areas)
-
-    # Set the factor threshold (e.g., 0.1 for 10%)
-    factor = 0.001999
-
-    # Convert grayscale image to BGR for coloring
-    img_color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-    # Create a blank mask for filled contours
+    area_factor = 0.0004
     filled_mask = np.zeros_like(image)
 
-    centroids = []
-    for i, (contour, area) in enumerate(zip(contours, areas)):
+    for contour, area in zip(contours, areas):
         ratio = area / total_area if total_area > 0 else 0
-        M = cv2.moments(contour)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-        else:
-            cx, cy = 0, 0
-        centroids.append((cx, cy, i, area, ratio))
-        if ratio > factor:
-            cv2.drawContours(img_color, [contour], -1, (0, 0, 255), thickness=cv2.FILLED)  # Fill large contours with red
-            cv2.drawContours(filled_mask, [contour], -1, 255, thickness=cv2.FILLED)  # Fill mask with white
+
+        if ratio > area_factor:
+            cv2.drawContours(filled_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            continue
+
+        if len(contour) >= 5:
+            _, _, w, h = cv2.boundingRect(contour)
+            long_side = max(w, h)
+            short_side = max(1, min(w, h))
+            aspect_ratio = long_side / short_side
+
+            if aspect_ratio > 2.5 and long_side > 12:
+                cv2.drawContours(filled_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                continue
+
+        if area > 150:
+            cv2.drawContours(filled_mask, [contour], -1, 255, thickness=cv2.FILLED)
+
     return filled_mask
 
 def extract_graphs(image, unique_lines):
@@ -235,54 +375,145 @@ def extract_graphs(image, unique_lines):
 
 
 def find_vertical_track_bounds(mask: np.ndarray, total_graphs: int) -> list[tuple[int, int]]:
-    height, width = mask.shape
+    """
+    Find vertical track boundaries from true low-density gap columns.
+    Falls back to equal splits when the gaps are ambiguous.
+    """
+    _, width = mask.shape
+    total_graphs = max(1, int(total_graphs))
+
     foreground = (mask == 255).astype(np.uint8)
-    col_density = foreground.mean(axis=0)
-    window = max(15, min(61, width // 40))
+    col_density = foreground.sum(axis=0).astype(float)
+
+    window = max(15, min(61, width // 30))
     if window % 2 == 0:
         window += 1
     smooth = np.convolve(col_density, np.ones(window) / window, mode="same")
-    threshold = max(0.003, float(np.percentile(smooth, 65)) * 0.55)
 
-    segments = []
-    in_segment = False
-    start = 0
-    for x, value in enumerate(smooth):
-        if value > threshold and not in_segment:
-            start = x
-            in_segment = True
-        if (value <= threshold or x == width - 1) and in_segment:
-            end = x
-            in_segment = False
-            if end - start >= max(20, width * 0.08):
-                segments.append((start, end))
+    max_density = float(smooth.max()) if smooth.size else 0.0
+    if max_density == 0:
+        step = width / total_graphs
+        return [(int(round(i * step)), int(round((i + 1) * step))) for i in range(total_graphs)]
 
-    if len(segments) < total_graphs:
-        step = width / max(1, total_graphs)
-        return [
-            (int(round(i * step)), int(round((i + 1) * step)))
-            for i in range(total_graphs)
-        ]
+    gap_threshold = max(2.0, max_density * 0.03)
+    gap_cols = np.where(smooth < gap_threshold)[0]
 
-    segments = sorted(segments, key=lambda seg: seg[1] - seg[0], reverse=True)
-    selected = sorted(segments[:total_graphs], key=lambda seg: seg[0])
-    return selected
+    if len(gap_cols) < total_graphs - 1:
+        print(f"[WARN] Not enough gap columns found ({len(gap_cols)}), using equal splits")
+        step = width / total_graphs
+        return [(int(round(i * step)), int(round((i + 1) * step))) for i in range(total_graphs)]
+
+    gap_groups = []
+    group = [int(gap_cols[0])]
+    for col in gap_cols[1:]:
+        col = int(col)
+        if col - group[-1] <= 3:
+            group.append(col)
+        else:
+            gap_groups.append(group)
+            group = [col]
+    gap_groups.append(group)
+
+    internal_gaps = []
+    edge_margin = max(10, int(width * 0.02))
+    for group in gap_groups:
+        if len(group) < 2:
+            continue
+        midpoint = int(np.mean(group))
+        if midpoint <= edge_margin or midpoint >= width - edge_margin:
+            continue
+        internal_gaps.append((midpoint, len(group)))
+
+    internal_gaps.sort(key=lambda item: item[1], reverse=True)
+    best_dividers = sorted(midpoint for midpoint, _ in internal_gaps[:total_graphs - 1])
+
+    if len(best_dividers) < total_graphs - 1:
+        step = width / total_graphs
+        for i in range(total_graphs - 1):
+            candidate = int(round((i + 1) * step))
+            if candidate not in best_dividers:
+                best_dividers.append(candidate)
+            if len(best_dividers) >= total_graphs - 1:
+                break
+        best_dividers = sorted(best_dividers[:total_graphs - 1])
+
+    bounds_x = [0] + best_dividers + [width]
+    segments = [(bounds_x[i], bounds_x[i + 1]) for i in range(total_graphs)]
+    trimmed_segments = []
+    min_track_width = max(20, int(width * 0.08))
+    for x1, x2 in segments:
+        local_smooth = smooth[x1:x2]
+        if local_smooth.size == 0:
+            trimmed_segments.append((x1, x2))
+            continue
+
+        active_threshold = max(2.0, float(np.percentile(local_smooth, 65)) * 0.55)
+        active_cols = np.where(local_smooth > active_threshold)[0]
+        if len(active_cols) == 0:
+            trimmed_segments.append((x1, x2))
+            continue
+
+        active_groups = []
+        group = [int(active_cols[0])]
+        for col in active_cols[1:]:
+            col = int(col)
+            if col - group[-1] <= 3:
+                group.append(col)
+            else:
+                active_groups.append(group)
+                group = [col]
+        active_groups.append(group)
+
+        best_group = max(active_groups, key=len)
+        trim_start = max(x1, x1 + best_group[0] - 4)
+        trim_end = min(x2, x1 + best_group[-1] + 5)
+        if trim_end - trim_start >= min_track_width:
+            trimmed_segments.append((trim_start, trim_end))
+        else:
+            trimmed_segments.append((x1, x2))
+
+    segments = trimmed_segments
+    print(f"[INFO] Track bounds found: {segments}")
+    return segments
 
 
 def extract_vertical_graph_tracks(mask: np.ndarray, total_graphs: int):
+    """
+    Extract vertical graph tracks with Kalman prediction through short gaps.
+    """
     bounds = find_vertical_track_bounds(mask, int(total_graphs))
     lines_data = {}
 
     for idx, (x_start, x_end) in enumerate(bounds):
         track = mask[:, x_start:x_end]
         track_width = max(1, x_end - x_start)
+        max_run_width = max(6, int(track_width * 0.18))
+        max_jump = max(80, track_width * 0.55)
+        max_row_ink = max(12, int(track_width * 0.35))
+        border_margin = max(3, int(track_width * 0.02))
         points = []
-        last_x = None
+        tracker = None
+
+        def bounded_x(local_x: float) -> int:
+            local_x = float(np.clip(local_x, 0, track_width - 1))
+            return int(round(np.clip(local_x + x_start, x_start, max(x_start, x_end - 1))))
+
+        def advance_prediction() -> bool:
+            nonlocal tracker
+            if tracker is None or tracker.is_lost:
+                return False
+            pred_x = tracker.predict()
+            if pred_x < -max_jump or pred_x > (track_width - 1 + max_jump):
+                tracker = None
+                return False
+            return True
 
         for y in range(track.shape[0]):
             xs = np.where(track[y, :] == 255)[0]
             if len(xs) == 0:
+                advance_prediction()
                 continue
+            row_has_too_much_ink = len(xs) > max_row_ink
 
             runs = []
             run_start = int(xs[0])
@@ -297,38 +528,91 @@ def extract_vertical_graph_tracks(mask: np.ndarray, total_graphs: int):
                     prev_x = raw_x
             runs.append((run_start, prev_x))
 
-            # Broad horizontal remnants are usually grid/labels, not the curve.
-            max_run_width = max(4, int(track_width * 0.18))
             candidates = []
+            track_right_edge = track_width - 1
             for run_x1, run_x2 in runs:
                 run_width = run_x2 - run_x1 + 1
-                if run_width > max_run_width:
+                if (
+                    row_has_too_much_ink
+                    and run_x1 <= 2
+                    and run_x2 >= track_right_edge - 2
+                ):
                     continue
-                center = (run_x1 + run_x2) / 2.0
-                candidates.append((center, run_width))
+
+                if run_x2 >= track_right_edge - 2 and run_width > max_run_width:
+                    if tracker is None or tracker.is_lost:
+                        continue
+                    trimmed_width = max(1, min(max_run_width, run_width // 2))
+                    trimmed_center = run_x1 + trimmed_width / 2.0
+                    candidates.append((trimmed_center, trimmed_width))
+                    continue
+
+                if run_x1 <= 2 and run_width > max_run_width:
+                    if tracker is None or tracker.is_lost:
+                        continue
+                    trimmed_center = max(0.0, run_x2 - max_run_width / 2.0)
+                    candidates.append((trimmed_center, max_run_width))
+                    continue
+
+                if run_width <= max_run_width:
+                    candidates.append(((run_x1 + run_x2) / 2.0, run_width))
+
             if not candidates:
+                advance_prediction()
                 continue
 
-            if last_x is None:
-                x_local = float(np.median([center for center, _ in candidates]))
-            else:
-                last_local = last_x - x_start
-                x_local, _ = min(candidates, key=lambda item: abs(item[0] - last_local))
-            x = x_local + x_start
-            if last_x is not None:
-                # Damp one-row jumps caused by small OCR/grid leftovers.
-                max_jump = max(25, track_width * 0.18)
-                if abs(x - last_x) > max_jump:
-                    continue
-            last_x = x
-            points.append([int(round(x)), int(y)])
+            interior_candidates = [
+                candidate
+                for candidate in candidates
+                if border_margin <= candidate[0] <= (track_width - 1 - border_margin)
+            ]
+            if interior_candidates:
+                candidates = interior_candidates
+            elif tracker is None or tracker.is_lost:
+                continue
 
-        lines_data[f"line_{idx+1}"] = smooth_vertical_points(points)
+            if tracker is None or tracker.is_lost:
+                x_local = float(np.median([center for center, _ in candidates]))
+                tracker = KalmanCurveTracker(initial_x=x_local)
+                measured = tracker.update(x_local)
+            else:
+                pred_x = tracker.predict()
+                if pred_x < -max_jump or pred_x > (track_width - 1 + max_jump):
+                    x_local = float(np.median([center for center, _ in candidates]))
+                    tracker = KalmanCurveTracker(initial_x=x_local)
+                    measured = tracker.update(x_local)
+                    points.append([bounded_x(measured), int(y)])
+                    continue
+
+                x_local, _ = min(
+                    candidates,
+                    key=lambda candidate: abs(candidate[0] - pred_x) + candidate[1] * 0.2,
+                )
+                if abs(x_local - pred_x) > max_jump:
+                    continue
+                measured = tracker.update(x_local)
+
+            points.append([bounded_x(measured), int(y)])
+
+        smoothed = smooth_vertical_points(points, window=5)
+        filled = fill_tracking_gaps(smoothed, max_gap_rows=120)
+        cleaned = ransac_outlier_removal(filled, residual_threshold=40)
+        refined = refine_tracked_points_with_mask(
+            cleaned,
+            mask_column=track,
+            x_offset=x_start,
+            search_radius=20,
+        )
+        lines_data[f"line_{idx+1}"] = [
+            [bounded_x(x - x_start), int(y)]
+            for x, y in refined
+            if 0 <= int(y) < mask.shape[0]
+        ]
 
     return lines_data, bounds
 
 
-def smooth_vertical_points(points, window=9):
+def smooth_vertical_points(points, window=5):
     if len(points) < 3:
         return points
     pts = sorted(points, key=lambda p: p[1])
@@ -340,20 +624,247 @@ def smooth_vertical_points(points, window=9):
         xs = np.asarray([np.median(padded[i:i + window]) for i in range(len(xs))], dtype=float)
     return [[int(round(x)), int(round(y))] for x, y in zip(xs, ys)]
 
+
+def fill_tracking_gaps(points, max_gap_rows=120):
+    """Fill missing row gaps in tracked points using cubic interpolation."""
+    if len(points) < 4:
+        return points
+
+    pts = sorted(points, key=lambda p: p[1])
+    ys = np.array([p[1] for p in pts])
+    xs = np.array([p[0] for p in pts], dtype=float)
+    y_min, y_max = int(ys.min()), int(ys.max())
+    existing_ys = set(int(y) for y in ys.tolist())
+
+    gap_start = None
+    gaps = []
+    for y in range(y_min, y_max + 1):
+        if y not in existing_ys:
+            if gap_start is None:
+                gap_start = y
+        elif gap_start is not None:
+            gap_len = y - gap_start
+            if gap_len <= max_gap_rows:
+                gaps.append((gap_start, y - 1))
+            gap_start = None
+
+    if not gaps:
+        return points
+
+    try:
+        from scipy.interpolate import CubicSpline
+        unique_y, unique_indices = np.unique(ys, return_index=True)
+        unique_x = xs[unique_indices]
+        if len(unique_y) < 4:
+            return points
+        spline = CubicSpline(unique_y, unique_x, extrapolate=False)
+    except Exception as e:
+        print(f"[WARN] Gap fill spline failed: {e}")
+        return points
+
+    filled = list(pts)
+    for gap_y_start, gap_y_end in gaps:
+        for y in range(gap_y_start, gap_y_end + 1):
+            x_interp = spline(float(y))
+            if not np.isnan(x_interp):
+                filled.append([int(round(float(x_interp))), int(y)])
+
+    return sorted(filled, key=lambda p: p[1])
+
+
+def refine_tracked_points_with_mask(points, mask_column, x_offset=0, search_radius=25):
+    """Snap tracked points back to nearby real mask pixels after Kalman smoothing."""
+    if not points or mask_column is None:
+        return points
+
+    refined = []
+    for gx, gy in sorted(points, key=lambda p: p[1]):
+        gy = int(gy)
+        lx = int(round(gx - x_offset))
+        if gy < 0 or gy >= mask_column.shape[0]:
+            refined.append([int(gx), gy])
+            continue
+
+        white_cols = np.where(mask_column[gy, :] == 255)[0]
+        if len(white_cols) == 0:
+            refined.append([int(gx), gy])
+            continue
+
+        nearby = white_cols[np.abs(white_cols.astype(int) - lx) <= search_radius]
+        if len(nearby) == 0:
+            refined.append([int(gx), gy])
+            continue
+
+        best_local = int(nearby[np.argmin(np.abs(nearby.astype(int) - lx))])
+        refined.append([best_local + x_offset, gy])
+
+    return refined
+
+
+def ransac_outlier_removal(points, residual_threshold=40, min_samples=10):
+    """Remove clear noise outliers while preserving legitimate curve spikes."""
+    if len(points) < min_samples:
+        return points
+
+    try:
+        from sklearn.linear_model import RANSACRegressor
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import PolynomialFeatures
+
+        pts = sorted(points, key=lambda p: p[1])
+        ys = np.array([p[1] for p in pts]).reshape(-1, 1)
+        xs = np.array([p[0] for p in pts])
+
+        ransac = make_pipeline(
+            PolynomialFeatures(degree=2),
+            RANSACRegressor(
+                residual_threshold=residual_threshold,
+                min_samples=max(0.5, min_samples / len(pts)),
+                max_trials=200,
+                random_state=42,
+            ),
+        )
+        ransac.fit(ys, xs)
+        inlier_mask = ransac.named_steps["ransacregressor"].inlier_mask_
+        cleaned = [p for p, inlier in zip(pts, inlier_mask) if inlier]
+
+        min_kept = int(len(pts) * 0.75)
+        if len(cleaned) < min_kept:
+            removed = len(pts) - len(cleaned)
+            print(
+                f"[WARN] RANSAC would remove {removed} pts "
+                f"({removed / len(pts) * 100:.0f}%); keeping original"
+            )
+            return pts
+
+        removed = len(pts) - len(cleaned)
+        if removed > 0:
+            print(f"[INFO] RANSAC removed {removed} outlier points ({removed / len(pts) * 100:.1f}%)")
+        return cleaned
+    except ImportError:
+        print("[WARN] scikit-learn not installed; skipping RANSAC")
+        return points
+    except Exception as e:
+        print(f"[WARN] RANSAC failed, keeping all points: {e}")
+        return points
+
+def _track_bounds_to_boundaries(track_bounds, image_height):
+    return [
+        {
+            "left": int(x1),
+            "right": int(x2),
+            "top": 0,
+            "bottom": int(image_height),
+        }
+        for x1, x2 in track_bounds
+    ]
+
+
+def _line_points_to_boundary(points, image_width, image_height, pad=8):
+    if not points:
+        return {"left": 0, "right": int(image_width), "top": 0, "bottom": int(image_height)}
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return {
+        "left": int(max(0, min(xs) - pad)),
+        "right": int(min(image_width, max(xs) + pad)),
+        "top": int(max(0, min(ys) - pad)),
+        "bottom": int(min(image_height, max(ys) + pad)),
+    }
+
+
+def _graph_points_to_boundaries(graph_points, image_width, image_height):
+    return [
+        _line_points_to_boundary(points, image_width, image_height)
+        for points in graph_points.values()
+    ]
+
+
 def run_pipeline_and_graph(img_np, threshold, total_graphs, patch_size, batch_size):
     input_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     cleaned_bgr = process_one_image(input_bgr, output_root=None, image_name='pipeline_input')
     if cleaned_bgr is None:
         raise ValueError('Grid removal failed in process_one_image')
 
+    color_masks = separate_color_curves(cleaned_bgr)
+    red_pixels = cv2.countNonZero(color_masks["red"])
+    green_pixels = cv2.countNonZero(color_masks["green"])
+    total_pixels = cleaned_bgr.shape[0] * cleaned_bgr.shape[1]
+    use_color_separation = (red_pixels + green_pixels) > (total_pixels * 0.001)
+
+    if use_color_separation:
+        print(f"[INFO] Color separation active: red={red_pixels}px, green={green_pixels}px")
+
+        red_refined = prepare_color_curve_mask(color_masks["red"])
+        green_refined = prepare_color_curve_mask(color_masks["green"])
+        black_refined = prepare_color_curve_mask(color_masks["black"])
+        combined_for_bounds = cv2.bitwise_or(
+            cv2.bitwise_or(red_refined, green_refined),
+            black_refined,
+        )
+
+        if cv2.countNonZero(combined_for_bounds) < 25:
+            print("[WARN] Color masks were too sparse; falling back to normal pipeline")
+        else:
+            track_bounds = find_vertical_track_bounds(combined_for_bounds, int(total_graphs))
+            print(f"[INFO] Color track bounds: {track_bounds}")
+
+            assigned_colors = {}
+            for color_name, refined in (("red", red_refined), ("green", green_refined)):
+                if cv2.countNonZero(refined) < 25:
+                    continue
+
+                best_track = None
+                best_pixels = 0
+                for track_idx, (x_start, x_end) in enumerate(track_bounds):
+                    if track_idx in assigned_colors:
+                        continue
+                    pixel_count = cv2.countNonZero(refined[:, x_start:x_end])
+                    if pixel_count > best_pixels:
+                        best_pixels = pixel_count
+                        best_track = track_idx
+
+                if best_track is not None and best_pixels > 25:
+                    assigned_colors[best_track] = color_name
+
+            colored_combined = cv2.bitwise_or(red_refined, green_refined)
+            black_only = cv2.bitwise_and(black_refined, cv2.bitwise_not(colored_combined))
+            graph_points = {}
+
+            for track_idx, (x_start, x_end) in enumerate(track_bounds):
+                color_name = assigned_colors.get(track_idx)
+                if color_name == "red":
+                    track_mask = red_refined[:, x_start:x_end]
+                elif color_name == "green":
+                    track_mask = green_refined[:, x_start:x_end]
+                else:
+                    track_mask = black_only[:, x_start:x_end]
+
+                if cv2.countNonZero(track_mask) < 25:
+                    track_mask = combined_for_bounds[:, x_start:x_end]
+
+                full_width_mask = np.zeros_like(combined_for_bounds)
+                full_width_mask[:, x_start:x_end] = track_mask
+                points, _ = extract_vertical_graph_tracks(full_width_mask, 1)
+                line_key = f"line_{track_idx + 1}"
+                graph_points[line_key] = points.get("line_1", [])
+                print(
+                    f"[INFO] Track {track_idx + 1} ({color_name or 'black'}): "
+                    f"{len(graph_points[line_key])} points"
+                )
+
+            if graph_points:
+                image_mask = cv2.cvtColor(combined_for_bounds, cv2.COLOR_GRAY2BGR)
+                for track_idx, (x1, x2) in enumerate(track_bounds):
+                    color = [(0, 0, 255), (0, 180, 0), (255, 165, 0)][track_idx % 3]
+                    cv2.rectangle(image_mask, (x1, 0), (x2, image_mask.shape[0] - 1), color, 2)
+                return image_mask, graph_points, _track_bounds_to_boundaries(track_bounds, image_mask.shape[0])
+
+    cleaned_bgr = apply_clahe(cleaned_bgr)
+
     if USE_UNET_PIPELINE:
         print('[INFO] Using SVM+UNet pipeline')
         model_dir = os.path.join(os.path.dirname(__file__), 'models')
-        with open(os.path.join(model_dir, 'svm_model.pkl'), 'rb') as model_file:
-            loaded_model = pickle.load(model_file)
-        with open(os.path.join(model_dir, 'scaler.pkl'), 'rb') as file:
-            loaded_scaler = pickle.load(file)
-
         model = UNet(n_channels=3, n_classes=1).to(device)
         candidate_weight_files = [
             os.path.join(model_dir, 'best_model.pth'),
@@ -402,38 +913,41 @@ def run_pipeline_and_graph(img_np, threshold, total_graphs, patch_size, batch_si
         ])
 
         full_mask = np.zeros((H, W), dtype=np.uint8)
-        svm_predictions = []
-        for patch in patches:
-            features = extract_features(patch)
-            features_scaled = loaded_scaler.transform([features])
-            svm_pred = loaded_model.predict(features_scaled)[0]
-            svm_predictions.append(svm_pred)
-
         pred_patches = []
         batch = []
         batch_indices = []
 
-        for i, (patch, svm_pred) in enumerate(zip(patches, svm_predictions)):
-            if svm_pred == 1:
-                patch_img = Image.fromarray(patch)
-                input_tensor = transform(patch_img)
-                batch.append(input_tensor)
-                batch_indices.append(i)
+        def flush_unet_batch():
+            nonlocal batch, batch_indices
+            if not batch:
+                return
+            batch_tensor = torch.stack(batch).to(device)
+            with torch.no_grad():
+                output = model(batch_tensor)
+                prediction = torch.sigmoid(output)
+                prediction = (prediction > threshold).float()
 
-                if len(batch) == batch_size or i == len(patches) - 1:
-                    batch_tensor = torch.stack(batch).to(device)
-                    with torch.no_grad():
-                        output = model(batch_tensor)
-                        prediction = torch.sigmoid(output)
-                        prediction = (prediction > threshold).float()
+            for j, pred in enumerate(prediction):
+                pred_mask = pred.squeeze().cpu().numpy() * 255
+                pred_mask = pred_mask.astype(np.uint8)
+                pred_patches.append((batch_indices[j], pred_mask))
 
-                    for j, pred in enumerate(prediction):
-                        pred_mask = pred.squeeze().cpu().numpy() * 255
-                        pred_mask = pred_mask.astype(np.uint8)
-                        pred_patches.append((batch_indices[j], pred_mask))
+            batch = []
+            batch_indices = []
 
-                    batch = []
-                    batch_indices = []
+        for i, patch in enumerate(patches):
+            if np.mean(patch) > 250:
+                continue
+
+            patch_img = Image.fromarray(patch)
+            input_tensor = transform(patch_img)
+            batch.append(input_tensor)
+            batch_indices.append(i)
+
+            if len(batch) == batch_size:
+                flush_unet_batch()
+
+        flush_unet_batch()
 
         for idx, pred_mask in pred_patches:
             i, j = patch_positions[idx]
@@ -448,7 +962,11 @@ def run_pipeline_and_graph(img_np, threshold, total_graphs, patch_size, batch_si
         print('[INFO] Using thresholded mask for graph reconstruction')
 
     # Removing noise
+    raw_mask_full = mask_full.copy()
     mask_full = refine_mask(mask_full)
+    if cv2.countNonZero(mask_full) == 0 and cv2.countNonZero(raw_mask_full) > 0:
+        print("[WARN] refine_mask removed all foreground; using raw mask")
+        mask_full = raw_mask_full
 
     if mask_full.shape[0] > mask_full.shape[1] * 1.5:
         graph_points, track_bounds = extract_vertical_graph_tracks(
@@ -460,14 +978,16 @@ def run_pipeline_and_graph(img_np, threshold, total_graphs, patch_size, batch_si
             color = (0, 0, 255) if idx == 0 else (0, 180, 0)
             cv2.rectangle(image_mask, (x1, 0), (x2, mask_full.shape[0] - 1), color, 2)
         print('[INFO] Using vertical track extraction for portrait log image')
+        graph_boundaries = _track_bounds_to_boundaries(track_bounds, mask_full.shape[0])
     else:
         # separating graphs
         image_mask, unique_lines = draw_horizontal_separators(image=mask_full, n_lines=total_graphs)
 
         # extract graph points
         graph_points = extract_graphs(image = mask_full, unique_lines=unique_lines)
+        graph_boundaries = _graph_points_to_boundaries(graph_points, mask_full.shape[1], mask_full.shape[0])
     
-    return image_mask, graph_points
+    return image_mask, graph_points, graph_boundaries
 
 class HeaderItem(BaseModel):
     Mnemonic: str
@@ -515,18 +1035,86 @@ def get_ocr_reader():
     return OCR_READER
 
 
+HEADER_OCR_KEYWORDS = [
+    "company",
+    "well",
+    "field",
+    "county",
+    "state",
+    "location",
+    "api",
+    "sec",
+    "twp",
+    "rge",
+    "permanent datum",
+    "log measured from",
+    "drilling measured from",
+    "elevation",
+    "ground level",
+    "log type",
+    "type log",
+]
+
+
+def score_header_ocr_text(text):
+    normalized = re.sub(r"\s+", " ", (text or "")).strip().lower()
+    if not normalized:
+        return 0.0
+
+    keyword_hits = sum(1 for keyword in HEADER_OCR_KEYWORDS if keyword in normalized)
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    alpha_ratio = sum(ch.isalnum() for ch in normalized) / max(1, len(normalized))
+    punctuation_bonus = normalized.count(":") * 4 + normalized.count("/") * 2
+    noise_penalty = sum(1 for ch in normalized if ch in "@#$%^*<>~") * 2
+
+    return (
+        keyword_hits * 120.0
+        + len(lines) * 6.0
+        + min(len(normalized), 4000) / 40.0
+        + alpha_ratio * 10.0
+        + punctuation_bonus
+        - noise_penalty
+    )
+
+
 def extract_header_text_easyocr(image):
     """Extract raw header text locally so header OCR works without API keys."""
     try:
         reader = get_ocr_reader()
-        results = reader.readtext(image, paragraph=True)
-        lines = []
-        for result in results:
-            if len(result) >= 2:
-                text = str(result[1]).strip()
-                if text:
-                    lines.append(text)
-        return "\n".join(lines)
+        base_image = Image.fromarray(image).convert("RGB")
+        candidates = [
+            ("rot90ccw", base_image.rotate(90, expand=True)),
+            ("rot0", base_image),
+            ("rot90cw", base_image.rotate(-90, expand=True)),
+            ("rot180", base_image.rotate(180, expand=True)),
+        ]
+
+        best_text = ""
+        best_score = float("-inf")
+        best_orientation = None
+
+        for orientation, candidate in candidates:
+            results = reader.readtext(np.array(candidate), paragraph=True)
+            lines = []
+            seen = set()
+            for result in results:
+                if len(result) >= 2:
+                    text = re.sub(r"\s+", " ", str(result[1]).strip())
+                    if text and text not in seen:
+                        seen.add(text)
+                        lines.append(text)
+            text = "\n".join(lines).strip()
+            score = score_header_ocr_text(text)
+            if score > best_score:
+                best_text = text
+                best_score = score
+                best_orientation = orientation
+            if score >= 350:
+                break
+
+        if best_orientation:
+            print(f"[INFO] EasyOCR header orientation selected: {best_orientation} (score={best_score:.1f})")
+        return best_text
     except Exception as e:
         print(f"[WARN] EasyOCR header extraction failed: {e}")
         return ""
@@ -576,7 +1164,7 @@ def extract_las_header(image):
             metadata = {
                 "engine": "easyocr",
                 "model": "easyocr.Reader(['en'])",
-                "strategy": None,
+                "strategy": "retry",
                 "status": "success" if raw_text else "failed",
                 "fallback_from": metadata,
             }
@@ -647,6 +1235,127 @@ def parse_well_log_ocr_to_las_header(ocr_text):
         "ADDITIONAL_STAMPS": ("NOTE", "", "Additional stamps and notes"),
     }
 
+    def normalize_value(value):
+        return re.sub(r"\s+", " ", str(value or "")).strip(" -:;|")
+
+    def extract_freeform_value(text, patterns):
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            value = match.group(1) if match.groups() else match.group(0)
+            value = normalize_value(value)
+            if value:
+                return value
+        return ""
+
+    flat_text = normalize_value(ocr_text)
+
+    freeform_fields = {
+        "LOG_TYPE": extract_freeform_value(flat_text, [
+            r"\b(microresistivity\s+log|digital\s+log|gamma\s+ray|micro\s+log|sp\s+log)\b",
+        ]),
+        "TYPE_LOG": extract_freeform_value(flat_text, [
+            r"\b(microresistivity\s+log|digital\s+log|gamma\s+ray|micro\s+log|sp\s+log)\b",
+        ]),
+        "API": extract_freeform_value(flat_text, [
+            r"\b(\d{2,3}-\d{3}-\d{2},\d{3}-\d{2}-\d{2})\b",
+            r"\bapi(?:\s*no\.?|\s*number)?[:\s_]*([0-9,\-]{8,})",
+        ]),
+        "COMPANY": extract_freeform_value(flat_text, [
+            r"\bcompany\b\s+(.+?)(?=\s+\bwell\b|\s+\bfield\b|\s+\bcounty\b|\s+\bstate\b|\s+\blocation\b|\s+\bapi\b|\s+\bsec\b|\s+\btwp\b|\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "WELL": extract_freeform_value(flat_text, [
+            r"\bwell\b\s+(.+?)(?=\s+\bfield\b|\s+\bcounty\b|\s+\bstate\b|\s+\blocation\b|\s+\bapi\b|\s+\bsec\b|\s+\btwp\b|\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "FIELD": extract_freeform_value(flat_text, [
+            r"\bfield\b\s+(.+?)(?=\s+\bcounty\b|\s+\bstate\b|\s+\blocation\b|\s+\bapi\b|\s+\bsec\b|\s+\btwp\b|\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "COUNTY": extract_freeform_value(flat_text, [
+            r"\bcounty\b\s+(.+?)(?=\s+\bstate\b|\s+\blocation\b|\s+\bapi\b|\s+\bsec\b|\s+\btwp\b|\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "STATE": extract_freeform_value(flat_text, [
+            r"\bstate\b\s+(.+?)(?=\s+\blocation\b|\s+\bapi\b|\s+\bsec\b|\s+\btwp\b|\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "LOCATION": extract_freeform_value(flat_text, [
+            r"\blocation\b\s+(.+?)(?=\s+\bsec\b|\s+\btwp\b|\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "SEC": extract_freeform_value(flat_text, [
+            r"\bsec[:\s]*([0-9A-Za-z\-]+)",
+        ]),
+        "TWP": extract_freeform_value(flat_text, [
+            r"\btwp[:\s]*([0-9A-Za-z\- ]+?)(?=\s+\brge\b|\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "RGE": extract_freeform_value(flat_text, [
+            r"\brge[:\s]*([0-9A-Za-z\- ]+?)(?=\s+\belevation\b|\s+\bpermanent datum\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "PERMANENT_DATUM": extract_freeform_value(flat_text, [
+            r"\bpermanent datum\b\s+(.+?)(?=\s+\bground level\b|\s+\belevation\b|\s+\blog measured from\b|\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b)",
+        ]),
+        "LOG_MEASURED_FROM": extract_freeform_value(flat_text, [
+            r"\blog measured from\b\s+(.+?)(?=\s+\bdrilling measured from\b|\s+\bdate\b|\s+\brun number\b|\s+\bdepth driller\b)",
+        ]),
+        "DRILLING_MEASURED_FROM": extract_freeform_value(flat_text, [
+            r"\bdrilling measured from\b\s+(.+?)(?=\s+\bdate\b|\s+\brun number\b|\s+\bdepth driller\b|\s+\bdepth logged interval\b)",
+        ]),
+        "DATE": extract_freeform_value(flat_text, [
+            r"\bdate\b[:\s]*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
+        ]),
+        "RUN_NO": extract_freeform_value(flat_text, [
+            r"\brun number\b\s+(.+?)(?=\s+\bdepth driller\b|\s+\bdepth logged interval\b|\s+\btop log interval\b|\s+\bbottom logged interval\b|\s+\bcasing driller\b)",
+        ]),
+        "DEPTH_DRILLER": extract_freeform_value(flat_text, [
+            r"\bdepth driller\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "DEPTH_LOGGER": extract_freeform_value(flat_text, [
+            r"\bdepth logger\b\s+([0-9]+(?:\.[0-9]+)?)",
+            r"\bdepth logged interval\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "BOTTOM_LOGGED_INTERVAL": extract_freeform_value(flat_text, [
+            r"\bbottom logged interval\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "TOP_LOGGED_INTERVAL": extract_freeform_value(flat_text, [
+            r"\btop log(?:ged)? interval\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "TYPE_FLUID_IN_HOLE": extract_freeform_value(flat_text, [
+            r"\btype fluid in hole\b\s+(.+?)(?=\s+\bsalinity\b|\s+\bdensity\b|\s+\blevel\b|\s+\bmax rec\b|\s+\boperating rig time\b|\s+\bequipment\b|\s+\brecorded by\b|\s+\bwitnessed by\b)",
+        ]),
+        "SALINITY_PPM_CL": extract_freeform_value(flat_text, [
+            r"\bsalinity ppm cl\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "DENSITY": extract_freeform_value(flat_text, [
+            r"\bdensity\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "LEVEL": extract_freeform_value(flat_text, [
+            r"\blevel\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "MAX_REC_TEMP_DEG_F": extract_freeform_value(flat_text, [
+            r"\bmax rec(?:orded)? temp(?:\.|erature)?(?:\s*f|\s*degf)?\b\s+([0-9]+(?:\.[0-9]+)?)",
+            r"\bmax rec\.?\s*temp\.?\s*f\b\s+([0-9]+(?:\.[0-9]+)?)",
+        ]),
+        "OPERATING_RIG_TIME": extract_freeform_value(flat_text, [
+            r"\boperating rig time\b\s+(.+?)(?=\s+\bequipment\b|\s+\brecorded by\b|\s+\bwitnessed by\b|\s+\bsource of\b|\s+\bcomments\b)",
+        ]),
+        "EQUIP_NO_LOCATION": extract_freeform_value(flat_text, [
+            r"\bequipment number(?:/| )?location\b\s+(.+?)(?=\s+\brecorded by\b|\s+\bwitnessed by\b|\s+\bsource of\b|\s+\bcomments\b)",
+        ]),
+        "RECORDED_BY": extract_freeform_value(flat_text, [
+            r"\brecorded by\b\s+(.+?)(?=\s+\bwitnessed by\b|\s+\bsource of\b|\s+\bcomments\b|\s+\bdate received\b)",
+        ]),
+        "WITNESSED_BY": extract_freeform_value(flat_text, [
+            r"\bwitnessed by\b\s+(.+?)(?=\s+\bsource of\b|\s+\bcomments\b|\s+\bdate received\b)",
+        ]),
+        "DATE_RECEIVED": extract_freeform_value(flat_text, [
+            r"\bdate received\b\s+([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
+        ]),
+        "COMMISSION_NAME": extract_freeform_value(flat_text, [
+            r"\bcommission name\b\s+(.+?)(?=\s+\bcomments\b|\s+\bdate received\b|\s+\breceived by\b)",
+        ]),
+        "ADDITIONAL_STAMPS": extract_freeform_value(flat_text, [
+            r"\badditional stamps\b\s+(.+)$",
+        ]),
+    }
+
     well_items = []
     for raw_line in ocr_text.splitlines():
         line = raw_line.strip().strip("-")
@@ -664,7 +1373,21 @@ def parse_well_log_ocr_to_las_header(ocr_text):
             "Value": value,
             "Unit": unit,
             "Description": description,
-        })
+            })
+
+    if not well_items:
+        for key, value in freeform_fields.items():
+            if not value or value.upper() in ("BLANK", "[BLANK]", "N/A", "NA"):
+                continue
+            if key not in key_map:
+                continue
+            mnemonic, unit, description = key_map[key]
+            well_items.append({
+                "Mnemonic": mnemonic,
+                "Value": value,
+                "Unit": unit,
+                "Description": description,
+            })
 
     if not well_items:
         return {}
@@ -721,6 +1444,239 @@ def extract_depth_ticks_ocr(graph_image):
         return []
 
 
+def _parse_numeric_header_value(value):
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _find_las_header_value(las_header, mnemonics):
+    wanted = {str(item).upper() for item in mnemonics}
+    for section_items in (las_header or {}).values():
+        if not isinstance(section_items, list):
+            continue
+        for item in section_items:
+            mnemonic = re.sub(
+                r"[^A-Z0-9]",
+                "",
+                str(item.get("Mnemonic") or item.get("mnemonic") or "").upper(),
+            )
+            if mnemonic in wanted:
+                return item.get("Value", item.get("value"))
+    return None
+
+
+def infer_depth_range_from_vision(graph_vision):
+    if not graph_vision or graph_vision.get("status") != "success":
+        return None
+    y_axis = graph_vision.get("y_axis", {})
+    if not y_axis:
+        return None
+    top = _parse_numeric_header_value(y_axis.get("min_value"))
+    bottom = _parse_numeric_header_value(y_axis.get("max_value"))
+    if top is None or bottom is None or top == bottom:
+        return None
+    return {
+        "top": min(top, bottom),
+        "bottom": max(top, bottom),
+        "unit": y_axis.get("unit", "FT") or "FT",
+        "source": "graph_vision",
+        "confidence": "high",
+        "tick_count": len(y_axis.get("tick_values", [])),
+    }
+
+
+def infer_depth_range_from_header(las_header):
+    top = _parse_numeric_header_value(
+        _find_las_header_value(las_header, ["TLI", "STRT", "TOP", "TOPLOGGEDINTERVAL"])
+    )
+    bottom = _parse_numeric_header_value(
+        _find_las_header_value(las_header, ["BLI", "STOP", "BOTTOM", "BOTTOMLOGGEDINTERVAL"])
+    )
+    if top is None or bottom is None or top == bottom:
+        return None
+    return {
+        "top": float(top),
+        "bottom": float(bottom),
+        "unit": "FT",
+        "source": "header",
+        "confidence": "high",
+        "tick_count": 2,
+    }
+
+
+def infer_depth_range_from_ticks(depth_ticks):
+    ticks = []
+    for tick in depth_ticks or []:
+        value = _parse_numeric_header_value(tick.get("value", tick.get("text")))
+        center = tick.get("center") or []
+        if value is None or len(center) < 2:
+            continue
+        try:
+            x = float(center[0])
+            y = float(center[1])
+        except (TypeError, ValueError):
+            continue
+        ticks.append({"value": value, "x": x, "y": y})
+
+    if len(ticks) < 2:
+        return None
+
+    columns = []
+    for tick in ticks:
+        column = next((candidate for candidate in columns if abs(candidate["x"] - tick["x"]) <= 60), None)
+        if column is None:
+            column = {"x": tick["x"], "ticks": []}
+            columns.append(column)
+        column["ticks"].append(tick)
+        column["x"] = sum(item["x"] for item in column["ticks"]) / len(column["ticks"])
+
+    def longest_sequence(column_ticks, direction):
+        sorted_ticks = sorted(column_ticks, key=lambda item: item["y"])
+        chains = [[tick] for tick in sorted_ticks]
+        for idx, tick in enumerate(sorted_ticks):
+            for prev in range(idx):
+                if direction * (tick["value"] - sorted_ticks[prev]["value"]) > 0 and len(chains[prev]) + 1 > len(chains[idx]):
+                    chains[idx] = [*chains[prev], tick]
+        return max(chains, key=len)
+
+    candidates = []
+    for column in columns:
+        for direction in (1, -1):
+            sequence = longest_sequence(column["ticks"], direction)
+            if len(sequence) >= 2:
+                candidates.append(sequence)
+
+    if not candidates:
+        return None
+
+    best = sorted(
+        candidates,
+        key=lambda sequence: (len(sequence), sequence[-1]["y"] - sequence[0]["y"]),
+        reverse=True,
+    )[0]
+    top = float(best[0]["value"])
+    bottom = float(best[-1]["value"])
+    if top == bottom:
+        return None
+    return {
+        "top": top,
+        "bottom": bottom,
+        "unit": "FT",
+        "source": "depth_ticks",
+        "confidence": "medium" if len(best) < 4 else "high",
+        "tick_count": len(best),
+    }
+
+
+def infer_depth_range(las_header, depth_ticks, graph_vision=None):
+    return (
+        infer_depth_range_from_vision(graph_vision)
+        or infer_depth_range_from_header(las_header)
+        or infer_depth_range_from_ticks(depth_ticks)
+    )
+
+
+def match_graph_curves_to_values(graph_image, graph_points, graph_bounds):
+    """
+    Enhanced curve-to-value matching for multi-curve graphs.
+    Automatically detects axis values and assigns them to curves.
+    
+    Args:
+        graph_image: numpy array (RGB) of the graph
+        graph_points: dict of curve point lists from extraction
+        graph_bounds: dict with {"left", "right", "top", "bottom"} pixel coords
+        
+    Returns:
+        dict with matched curves and their value ranges
+    """
+    try:
+        h, w = graph_image.shape[:2]
+        matcher = CurveValueMatcher((h, w))
+        
+        # Extract all OCR results
+        reader = get_ocr_reader()
+        ocr_results = reader.readtext(graph_image)
+        
+        # Separate X and Y axis labels
+        x_labels = matcher.extract_x_axis_labels(graph_image, ocr_results)
+        y_labels = matcher.extract_y_axis_labels(graph_image, ocr_results)
+        
+        print(f"[INFO] X-axis labels detected: {len(x_labels)}")
+        for label in x_labels:
+            print(f"  Value: {label.value} | Confidence: {label.confidence} | Pos: {label.position}")
+        
+        print(f"[INFO] Y-axis labels detected: {len(y_labels)}")
+        for label in y_labels:
+            print(f"  Value: {label.value} | Confidence: {label.confidence} | Pos: {label.position}")
+        
+        # Create CurveInfo objects from detected points
+        curves = []
+        for idx, (curve_name, points) in enumerate(graph_points.items()):
+            if points:
+                curve = create_curve_info(idx, points)
+                curves.append(curve)
+        
+        # Match curves to values
+        matched_curves = matcher.match_curves_to_values(
+            curves, x_labels, y_labels, graph_bounds
+        )
+        
+        # Detect curve colors for additional identification
+        matched_curves = matcher.detect_curve_colors(graph_image, matched_curves)
+        
+        # Generate summary
+        summary = matcher.generate_summary(matched_curves)
+        print(summary)
+        
+        # Convert to JSON-serializable format
+        matched_output = {
+            "curves": [
+                {
+                    "id": c.curve_id,
+                    "label": c.label or f"Curve {c.curve_id + 1}",
+                    "points_count": len(c.points),
+                    "bounds": c.bounds,
+                    "x_range": list(c.x_range) if c.x_range else None,
+                    "y_range": list(c.y_range) if c.y_range else None,
+                    "color": list(c.color) if c.color else None
+                }
+                for c in matched_curves
+            ],
+            "x_labels": [
+                {
+                    "text": l.text,
+                    "value": l.value,
+                    "position": list(l.position),
+                    "confidence": l.confidence
+                }
+                for l in x_labels
+            ],
+            "y_labels": [
+                {
+                    "text": l.text,
+                    "value": l.value,
+                    "position": list(l.position),
+                    "confidence": l.confidence
+                }
+                for l in y_labels
+            ],
+            "summary": summary
+        }
+        
+        return matched_output
+        
+    except Exception as e:
+        print(f"[WARN] Curve-value matching failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"curves": [], "x_labels": [], "y_labels": [], "error": str(e)}
+
+
 def resolve_local_path(path_value):
     if not path_value:
         return None
@@ -728,6 +1684,15 @@ def resolve_local_path(path_value):
     if path.is_absolute():
         return path
     return Path(__file__).resolve().parent / path
+
+
+def is_git_lfs_pointer_file(path):
+    try:
+        if not path or not path.exists() or path.stat().st_size > 512:
+            return False
+        return path.read_text(errors="ignore").startswith("version https://git-lfs.github.com/spec/v1")
+    except Exception:
+        return False
 
 
 def encode_png_base64(image_rgb):
@@ -804,6 +1769,9 @@ def detect_layout_regions(image_rgb, model_path):
 
     if not resolved_model_path or not resolved_model_path.exists():
         print(f"[WARN] Header/graph layout model missing, using fallback: {resolved_model_path}")
+        return fallback
+    if is_git_lfs_pointer_file(resolved_model_path):
+        print(f"[WARN] Header/graph layout model is a Git LFS pointer, using fallback: {resolved_model_path}")
         return fallback
 
     try:
@@ -933,50 +1901,79 @@ def extract_header_info_and_graph_part(
     depth_ticks = extract_depth_ticks_ocr(body_image) if include_depth_ocr else []
     return las_header, header_ocr_text, header_ocr_metadata, body_image, depth_ticks, layout
 
+def clamp_float(value, low=0.0, high=1.0):
+    return max(low, min(high, float(value)))
+
+
+def pixel_x_to_physical(pixel_x, left_bound, right_bound, min_value, max_value):
+    """Convert a pixel x-coordinate into the user-entered physical curve value."""
+    left_bound = float(left_bound)
+    right_bound = float(right_bound)
+    min_value = float(min_value)
+    max_value = float(max_value)
+    if right_bound == left_bound:
+        return min_value
+    ratio = clamp_float((float(pixel_x) - left_bound) / (right_bound - left_bound))
+    return min_value + ratio * (max_value - min_value)
+
+
+def pixel_y_to_depth(pixel_y, top_pixel, bottom_pixel, top_depth, bottom_depth):
+    """Convert a pixel y-coordinate into real well depth using the export bounds."""
+    top_pixel = float(top_pixel)
+    bottom_pixel = float(bottom_pixel)
+    top_depth = float(top_depth)
+    bottom_depth = float(bottom_depth)
+    if bottom_pixel == top_pixel:
+        return top_depth
+    ratio = clamp_float((float(pixel_y) - top_pixel) / (bottom_pixel - top_pixel))
+    return top_depth + ratio * (bottom_depth - top_depth)
+
+
+def pixel_points_to_physical(points, pixel_bounds, x_range, y_range):
+    """Convert tracked pixel points to [physical_value, real_depth] pairs."""
+    if not pixel_bounds or len(pixel_bounds) != 4:
+        raise ValueError("pixel_bounds must be [left, top, right, bottom]")
+    if not x_range or len(x_range) != 2:
+        raise ValueError("x_range must be [min_value, max_value]")
+    if not y_range or len(y_range) != 2:
+        raise ValueError("y_range must be [top_depth, bottom_depth]")
+
+    left, top, right, bottom = [float(value) for value in pixel_bounds]
+    min_value, max_value = [float(value) for value in x_range]
+    top_depth, bottom_depth = [float(value) for value in y_range]
+
+    converted = []
+    for pixel_x, pixel_y in points:
+        converted.append([
+            pixel_x_to_physical(pixel_x, left, right, min_value, max_value),
+            pixel_y_to_depth(pixel_y, top, bottom, top_depth, bottom_depth),
+        ])
+    return converted
+
+
 def rescale_pixel_data(points, current_bounds, target_bounds, debug=True):
-    """
-    Rescale pixel coordinates while maintaining shape proportions.
-    
-    Args:
-        points: List of [x, y] coordinates
-        current_bounds: Tuple (min_x, min_y, max_x, max_y) of current coordinate system
-        target_bounds: Tuple (min_x, min_y, max_x, max_y) of target coordinate system
-        debug: Print scaling information
-    
-    Returns:
-        List of rescaled [x, y] coordinates
-    """
-    curr_min_x, curr_min_y, curr_max_x, curr_max_y = current_bounds
-    target_min_x, target_min_y, target_max_x, target_max_y = target_bounds
-    
-    # Calculate scaling factors
-    scale_x = (target_max_x - target_min_x) / (curr_max_x - curr_min_x)
-    scale_y = (target_max_y - target_min_y) / (curr_max_y - curr_min_y)
-    
-    # if debug:
-    #     print(f"Current bounds: {current_bounds}")
-    #     print(f"Target bounds: {target_bounds}")
-    #     print(f"X scale factor: {scale_x:.4f}")
-    #     print(f"Y scale factor: {scale_y:.4f}")
-    #     print(f"Current width: {curr_max_x - curr_min_x}")
-    #     print(f"Target width: {target_max_x - target_min_x}")
-    
-    rescaled_points = []
-    for x, y in points:
-        # Apply linear transformation
-        new_x = target_min_x + (x - curr_min_x) * scale_x
-        new_y = target_min_y + (y - curr_min_y) * scale_y
-        rescaled_points.append([new_x, new_y])
-        
-        # if debug and len(rescaled_points) <= 3:  # Show first few transformations
-            # print(f"({x}, {y}) → ({new_x:.2f}, {new_y:.2f})")
-    
-    return rescaled_points
+    """Backward-compatible wrapper for older callers."""
+    return pixel_points_to_physical(
+        points,
+        pixel_bounds=current_bounds,
+        x_range=(target_bounds[0], target_bounds[2]),
+        y_range=(target_bounds[1], target_bounds[3]),
+    )
 
 def get_pixel_bounds(points):
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return (min(xs), min(ys), max(xs), max(ys))  # (x_min, y_min, x_max, y_max)
+
+
+PROTECTED_LAS_HEADER_FIELDS = {"STRT", "STOP", "STEP", "NULL", "VERS", "WRAP"}
+
+
+def sanitize_las_field(value, max_len=60):
+    """Remove OCR artifacts that commonly break LAS headers."""
+    value = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:max_len]
 
 def populate_las_from_json(las, json_data):
     """Populate LAS file headers from JSON data"""
@@ -1000,13 +1997,20 @@ def populate_las_from_json(las, json_data):
     # 2. Populate well section
     if 'las.well' in json_data:
         for item in json_data['las.well']:
-            mnemonic = item['Mnemonic']
-            value = item['Value']
-            unit = item.get('Unit', '')
-            description = item.get('Description', '')
+            mnemonic = normalize_header_text_key(item['Mnemonic'])
+            if mnemonic in PROTECTED_LAS_HEADER_FIELDS:
+                continue
+            value = sanitize_las_field(item.get('Value', ''))
+            unit = sanitize_las_field(item.get('Unit', ''), max_len=16)
+            description = sanitize_las_field(item.get('Description', ''))
             
             # Handle multiple entries with same mnemonic (like DATE, TDD, etc.)
             if mnemonic in las.well:
+                existing_value = clean_las_header_value(getattr(las.well[mnemonic], "value", ""))
+                if not existing_value:
+                    las.well[mnemonic] = lasio.HeaderItem(mnemonic, unit=unit, value=value, descr=description)
+                    continue
+
                 # If mnemonic already exists, create a unique one by appending number
                 counter = 1
                 original_mnemonic = mnemonic
@@ -1017,10 +2021,10 @@ def populate_las_from_json(las, json_data):
             las.well[mnemonic] = lasio.HeaderItem(mnemonic, unit=unit, value=value, descr=description)
     return las
 
-def create_las_with_dict(json_data, curves_dict, curve_metadata=None, depth_unit="F", depth_step=None):
+def create_las_with_dict(json_data, curves_dict, curve_metadata=None, depth_unit="FT", depth_step=None):
     """Create LAS file from curves with interpolation to common depth."""
     curve_metadata = curve_metadata or {}
-    depth_unit = depth_unit or "F"
+    depth_unit = depth_unit or "FT"
     
     all_depths = np.concatenate([np.asarray(depths, dtype=float) for depths, _ in curves_dict.values()])
     start_depth = float(np.nanmin(all_depths))
@@ -1229,9 +2233,183 @@ def format_header_text_for_las(header_text):
     return "\n".join(line for line in lines).strip()
 
 
+LAS_EXPORT_VERSION_TEMPLATE = [
+    {"Mnemonic": "VERS", "Value": "2.0", "Unit": "", "Description": "CWLS log ASCII Standard -VERSION 2.0"},
+    {"Mnemonic": "WRAP", "Value": "NO", "Unit": "", "Description": "One line per depth step"},
+]
+
+LAS_EXPORT_WELL_TEMPLATE = [
+    ("COMP", "", "COMPANY"),
+    ("WELL", "", "WELL"),
+    ("FLD", "", "FIELD"),
+    ("LOC", "", "LOCATION"),
+    ("PROV", "", "PROVINCE"),
+    ("CNTY", "", "COUNTY"),
+    ("STAT", "", "STATE"),
+    ("CTRY", "", "COUNTRY"),
+    ("SRVC", "", "SERVICE COMPANY"),
+    ("DATE", "", "DATE"),
+    ("UWI", "", "UNIQUE WELL ID"),
+    ("API", "", "API NUMBER"),
+]
+
+HEADER_TEXT_KEY_TO_MNEMONIC = {
+    "COMP": "COMP",
+    "COMPANY": "COMP",
+    "WELL": "WELL",
+    "FLD": "FLD",
+    "FIELD": "FLD",
+    "LOC": "LOC",
+    "LOCATION": "LOC",
+    "PROV": "PROV",
+    "PROVINCE": "PROV",
+    "CNTY": "CNTY",
+    "COUNTY": "CNTY",
+    "STAT": "STAT",
+    "STATE": "STAT",
+    "CTRY": "CTRY",
+    "COUNTRY": "CTRY",
+    "SRVC": "SRVC",
+    "SERVICE_COMPANY": "SRVC",
+    "LOG_TYPE": "SRVC",
+    "TYPE_LOG": "SRVC",
+    "DATE": "DATE",
+    "UWI": "UWI",
+    "UNIQUE_WELL_ID": "UWI",
+    "UNIQUE_WELL": "UWI",
+    "API": "API",
+    "API_NUMBER": "API",
+}
+
+LAS_EMPTY_VALUES = {"", "BLANK", "[BLANK]", "[VALUE]", "[VALUE OR BLANK]", "N/A", "NA", "NONE", "NULL"}
+
+
+def clean_las_header_value(value):
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" -:;|")
+    return "" if value.upper() in LAS_EMPTY_VALUES else value
+
+
+def normalize_header_text_key(key):
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(key or "")).upper().strip("_")
+
+
+def extract_values_from_header_json(header_json):
+    values = {}
+    for item in (header_json or {}).get("las.well", []):
+        mnemonic = normalize_header_text_key(item.get("Mnemonic", ""))
+        value = clean_las_header_value(item.get("Value", ""))
+        if mnemonic and value:
+            values[mnemonic] = value
+    return values
+
+
+def extract_values_from_colon_header_text(header_text):
+    values = {}
+    for raw_line in str(header_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line or ":" not in line or re.match(r"^[A-Za-z][A-Za-z0-9_]{0,7}\s*\.", line):
+            continue
+        key, value = line.split(":", 1)
+        mnemonic = HEADER_TEXT_KEY_TO_MNEMONIC.get(normalize_header_text_key(key))
+        value = clean_las_header_value(value)
+        if mnemonic and value:
+            values[mnemonic] = value
+    return values
+
+
+def extract_values_from_las_style_header_text(header_text):
+    values = {}
+    for raw_line in str(header_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        match = re.match(r"^([A-Za-z][A-Za-z0-9_]{0,7})\s*\.\s*([A-Za-z0-9/%]*)?\s*(.*?)\s*:", line)
+        if not match:
+            continue
+        mnemonic = HEADER_TEXT_KEY_TO_MNEMONIC.get(normalize_header_text_key(match.group(1)))
+        value = clean_las_header_value(match.group(3))
+        if mnemonic and value:
+            values[mnemonic] = value
+    return values
+
+
+def build_las_export_header_from_ocr(header_ocr_text):
+    """Build a LAS header from OCR only; missing fields stay blank."""
+    header_text = str(header_ocr_text or "")
+    parsed_header = parse_well_log_ocr_to_las_header(header_text) if header_text.strip() else {}
+    values = {}
+    values.update(extract_values_from_header_json(parsed_header))
+    values.update(extract_values_from_colon_header_text(header_text))
+    values.update(extract_values_from_las_style_header_text(header_text))
+
+    well_items = []
+    for mnemonic, unit, description in LAS_EXPORT_WELL_TEMPLATE:
+        well_items.append({
+            "Mnemonic": mnemonic,
+            "Value": values.get(mnemonic, ""),
+            "Unit": unit,
+            "Description": description,
+        })
+
+    standard_mnemonics = {mnemonic for mnemonic, _, _ in LAS_EXPORT_WELL_TEMPLATE}
+    for item in (parsed_header or {}).get("las.well", []):
+        mnemonic = normalize_header_text_key(item.get("Mnemonic", ""))
+        value = clean_las_header_value(item.get("Value", ""))
+        if not mnemonic or mnemonic in standard_mnemonics or not value:
+            continue
+        well_items.append({
+            "Mnemonic": mnemonic,
+            "Value": value,
+            "Unit": item.get("Unit", "") or "",
+            "Description": item.get("Description", "") or mnemonic,
+        })
+
+    return {
+        "las.version": [dict(item) for item in LAS_EXPORT_VERSION_TEMPLATE],
+        "las.well": well_items,
+    }
+
+
+def merge_las_header_overrides(base_header, override_header):
+    """Apply frontend/manual LAS well-header values over OCR-derived headers."""
+    if not override_header:
+        return base_header
+
+    merged = {
+        "las.version": list(base_header.get("las.version", [])),
+        "las.well": [dict(item) for item in base_header.get("las.well", [])],
+    }
+    override_rows = (override_header or {}).get("las.well", [])
+    overrides_by_mnemonic = {}
+    for item in override_rows:
+        mnemonic = normalize_header_text_key(item.get("Mnemonic", ""))
+        if not mnemonic:
+            continue
+        overrides_by_mnemonic[mnemonic] = {
+            "Mnemonic": mnemonic,
+            "Value": sanitize_las_field(item.get("Value", "")),
+            "Unit": sanitize_las_field(item.get("Unit", ""), max_len=16),
+            "Description": sanitize_las_field(item.get("Description", "") or mnemonic),
+        }
+
+    if not overrides_by_mnemonic:
+        return merged
+
+    seen = set()
+    for item in merged["las.well"]:
+        mnemonic = normalize_header_text_key(item.get("Mnemonic", ""))
+        if mnemonic in overrides_by_mnemonic:
+            item.update(overrides_by_mnemonic[mnemonic])
+            seen.add(mnemonic)
+
+    for mnemonic, item in overrides_by_mnemonic.items():
+        if mnemonic not in seen:
+            merged["las.well"].append(item)
+
+    return merged
+
+
 def prepend_las_header_comments(las_text, header_ocr_text=""):
     comment_lines = []
-    comment_lines.extend(_las_comment_lines("HEADER OCR EXTRACTION TEXT", format_header_text_for_las(header_ocr_text)))
+    comment_lines.extend(_las_comment_lines("HEADER OCR EXTRACTION TEXT", header_ocr_text))
     comment_lines.append("#")
     return "\n".join(comment_lines) + "\n" + las_text
 
@@ -1244,6 +2422,7 @@ async def segment_and_graph(
     batch_size: int = Form(32),
     include_header_ocr: bool = Form(False),
     include_depth_ocr: bool = Form(False),
+    include_graph_vision: bool = Form(False),
     manual_graph_box: Optional[str] = Form(None),
 ):
     ext = file.filename.lower().rsplit(".", 1)[-1]
@@ -1262,15 +2441,31 @@ async def segment_and_graph(
         except Exception:
             raise HTTPException(400, "manual_graph_box must be valid JSON")
 
-    # GET HEADER AND GRAPH PART FROM WHOLE IMAGE
-    las_file_header, header_ocr_text, header_ocr_metadata, image_without_b, depth_ticks, layout_info = extract_header_info_and_graph_part(
-        img_cv2=img,
-        model_path=YOLO_MODEL_PATH,
-        include_header_ocr=include_header_ocr,
-        include_depth_ocr=include_depth_ocr,
-        manual_graph_box=manual_box,
-    )
-    header_image = crop_box(img, layout_info["header_box"])
+    try:
+        # GET HEADER AND GRAPH PART FROM WHOLE IMAGE
+        las_file_header, header_ocr_text, header_ocr_metadata, image_without_b, depth_ticks, layout_info = extract_header_info_and_graph_part(
+            img_cv2=img,
+            model_path=YOLO_MODEL_PATH,
+            include_header_ocr=include_header_ocr,
+            include_depth_ocr=include_depth_ocr,
+            manual_graph_box=manual_box,
+        )
+        header_image = crop_box(img, layout_info["header_box"])
+    except Exception as e:
+        print(f"[WARN] Header/layout extraction failed, using full-page fallback: {e}")
+        layout_info = detect_layout_with_density(img)
+        header_image = crop_box(img, layout_info["header_box"])
+        image_without_b = crop_box(img, layout_info["graph_box"])
+        las_file_header = {}
+        header_ocr_text = ""
+        header_ocr_metadata = {
+            "engine": "error",
+            "model": HEADER_OCR_MODEL,
+            "strategy": None,
+            "status": "failed",
+            "error": str(e),
+        }
+        depth_ticks = []
 
     image_for_curve_pipeline = image_without_b
     tiff_preprocessing_info = None
@@ -1291,14 +2486,62 @@ async def segment_and_graph(
             print(f"[WARN] TIFF preprocessing failed, continuing with original image: {e}")
 
     original_height, original_width = image_for_curve_pipeline.shape[:2]
-    _, graph_points = run_pipeline_and_graph(
-        image_for_curve_pipeline,
-        threshold,
-        total_graphs,
-        patch_size,
-        batch_size,
+    try:
+        _, graph_points, graph_boundaries = run_pipeline_and_graph(
+            image_for_curve_pipeline,
+            threshold,
+            total_graphs,
+            patch_size,
+            batch_size,
+        )
+    except Exception as e:
+        print(f"[WARN] Primary graph pipeline failed, using fallback thresholding: {e}")
+        fallback_input = image_for_curve_pipeline
+        if fallback_input.ndim == 3:
+            fallback_gray = cv2.cvtColor(fallback_input, cv2.COLOR_RGB2GRAY)
+        else:
+            fallback_gray = fallback_input
+        _, mask_full = cv2.threshold(fallback_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        mask_full = refine_mask(mask_full)
+        if mask_full.shape[0] > mask_full.shape[1] * 1.5:
+            graph_points, track_bounds = extract_vertical_graph_tracks(mask_full, int(total_graphs))
+            graph_boundaries = _track_bounds_to_boundaries(track_bounds, mask_full.shape[0])
+        else:
+            _, unique_lines = draw_horizontal_separators(image=mask_full, n_lines=total_graphs)
+            graph_points = extract_graphs(image=mask_full, unique_lines=unique_lines)
+            graph_boundaries = _graph_points_to_boundaries(graph_points, mask_full.shape[1], mask_full.shape[0])
+        print("[INFO] Fallback graph extraction completed")
+
+    # ──────── ENHANCED: Curve-to-Value Matching ────────
+    graph_bounds = {
+        "left": 0,
+        "right": original_width,
+        "top": 0,
+        "bottom": original_height
+    }
+    curve_value_match = match_graph_curves_to_values(
+        image_without_b,
+        graph_points,
+        graph_bounds
     )
 
+    graph_vision = None
+    if include_graph_vision:
+        try:
+            graph_vision = analyze_graph_array_with_vision(image_without_b)
+        except Exception as e:
+            graph_vision = {
+                "status": "failed",
+                "error": str(e),
+            }
+
+    depth_range = infer_depth_range(las_file_header, depth_ticks, graph_vision)
+    if depth_range:
+        print(
+            f"[INFO] Depth range detected from {depth_range['source']}: "
+            f"{depth_range['top']} {depth_range['unit']} -> {depth_range['bottom']} {depth_range['unit']}"
+        )
+    
     image_b64 = encode_png_base64(image_without_b)
     header_b64 = encode_png_base64(header_image)
 
@@ -1307,6 +2550,9 @@ async def segment_and_graph(
         "header_png_base64": header_b64,
         "graph_png_base64": image_b64,
         "graph_points": graph_points,
+        "graph_boundaries": graph_boundaries,
+        "curve_value_match": curve_value_match,
+        "graph_vision": graph_vision,
         "image_dimensions": {
             "width": original_width,
             "height": original_height
@@ -1316,8 +2562,55 @@ async def segment_and_graph(
         "header_ocr_text": header_ocr_text,
         "header_ocr": header_ocr_metadata,
         "depth_ticks": depth_ticks,
+        "depth_range": depth_range,
         "tiff_preprocessing": tiff_preprocessing_info
     })
+
+
+def analyze_graph_array_with_vision(
+    image_rgb: np.ndarray,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+):
+    """Run graph vision analysis on an RGB image array."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        Image.fromarray(image_rgb).save(tmp_path)
+        analyzer = GraphVisionAnalyzer(provider=provider, model=model)
+        analysis = analyzer.analyze_graph_image(str(tmp_path))
+        result = analyzer.format_analysis_for_api(analysis)
+        result["status"] = "success"
+        result["provider"] = analyzer.provider
+        result["model"] = analyzer.model
+        return result
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@app.post("/analyze-graph-image")
+async def analyze_graph_image_endpoint(
+    file: UploadFile = File(...),
+    provider: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+):
+    ext = file.filename.lower().rsplit(".", 1)[-1]
+    if ext not in ("png", "jpg", "jpeg", "webp", "gif", "tif", "tiff"):
+        raise HTTPException(400, "Unsupported image format")
+
+    data = await file.read()
+    img = decode_upload_image(data, ext)
+    if img is None:
+        raise HTTPException(400, "Failed to decode image")
+
+    try:
+        return JSONResponse(analyze_graph_array_with_vision(img, provider=provider, model=model))
+    except Exception as e:
+        raise HTTPException(500, f"Graph vision analysis failed: {str(e)}")
 
 
 @app.post("/tiff-chunk-detect")
@@ -1416,22 +2709,33 @@ async def generate_las(request: Request):
         graph_info = data_received["graph_info"]
         las_file_header = data_received["las_file_header"]
         curve_metadata = data_received.get("curve_metadata", {})
-        depth_unit = data_received.get("depth_unit", "F")
+        depth_unit = data_received.get("depth_unit", "FT")
         depth_step = data_received.get("depth_step", 0.5)
         header_ocr_text = data_received.get("header_ocr_text", "")
-        if not str(header_ocr_text or "").strip():
-            header_ocr_text = format_las_header_json_as_text(las_file_header)
+        las_header_for_export = merge_las_header_overrides(
+            build_las_export_header_from_ocr(header_ocr_text),
+            las_file_header,
+        )
         # Rescale pixel data
         rescaled_data = {}
         for graph_name, graph in graph_info.items():
             x_range = graph["x_range"]
             y_range = graph["y_range"]
-            target_bounds = (x_range[0], y_range[0], x_range[1], y_range[1])
             pixel_bounds = graph.get("pixel_bounds")
+            if not pixel_bounds:
+                print(
+                    f"[WARN] {graph_name} is missing pixel_bounds; "
+                    "falling back to point bounds, which may stretch the curve."
+                )
 
             for line_name, line_points in graph["lines"].items():
-                current_bounds = tuple(pixel_bounds) if pixel_bounds else get_pixel_bounds(line_points)
-                rescaled_data[line_name] = rescale_pixel_data(line_points, current_bounds, target_bounds)
+                current_pixel_bounds = tuple(pixel_bounds) if pixel_bounds else get_pixel_bounds(line_points)
+                rescaled_data[line_name] = pixel_points_to_physical(
+                    line_points,
+                    current_pixel_bounds,
+                    x_range,
+                    y_range,
+                )
 
         # Generate curves
         curves_dict = {}
@@ -1443,7 +2747,7 @@ async def generate_las(request: Request):
 
         # Create LAS object
         las = create_las_with_dict(
-            las_file_header,
+            las_header_for_export,
             curves_dict,
             curve_metadata=curve_metadata,
             depth_unit=depth_unit,
@@ -1454,10 +2758,11 @@ async def generate_las(request: Request):
         buffer = io.StringIO()
         las.write(buffer)
         las_text = buffer.getvalue()
-        las_text = prepend_las_header_comments(
-            las_text,
-            header_ocr_text=header_ocr_text,
-        )
+        las_text = "\n".join(
+            line for line in las_text.splitlines()
+            if not re.match(r"^\s*DLM\s*\.", line, flags=re.IGNORECASE)
+        ) + ("\n" if las_text.endswith("\n") else "")
+        las_text = las_text.replace(" -999.25 ", " -999.2500 ")
         las_content = las_text.encode("utf-8")
         base64_las = base64.b64encode(las_content).decode("utf-8")
 

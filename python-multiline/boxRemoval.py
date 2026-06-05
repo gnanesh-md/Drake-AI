@@ -43,6 +43,7 @@ ISO_LINE_MIN_LEN       = 18
 ISO_LINE_MAX_LEN       = 140
 ISO_LINE_MAX_THICK     = 5
 ISO_NEIGHBOR_RADIUS    = 2
+RECONSTRUCT_GRID_INTERSECTIONS = False
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 def cluster_1d_values(values, tolerance=5):
@@ -352,18 +353,79 @@ def preprocess_keep_black_drop_blue(image_bgr,
     black_mask = gray <= int(black_thresh)
 
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    red_mask = (
+        (cv2.inRange(hsv, np.array([0, 45, 35], dtype=np.uint8), np.array([12, 255, 255], dtype=np.uint8)) > 0)
+        | (cv2.inRange(hsv, np.array([165, 45, 35], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8)) > 0)
+    )
+    green_mask = cv2.inRange(
+        hsv,
+        np.array([35, 45, 35], dtype=np.uint8),
+        np.array([95, 255, 255], dtype=np.uint8),
+    ) > 0
     blue_mask = cv2.inRange(
         hsv,
         np.array([blue_h_low, blue_s_min, blue_v_min], dtype=np.uint8),
         np.array([blue_h_high, 255, 255], dtype=np.uint8),
     ) > 0
 
-    keep_mask = black_mask & (~blue_mask)
+    keep_mask = (black_mask | red_mask | green_mask) & (~blue_mask)
 
     out = np.full_like(image_bgr, 255)
     out[keep_mask] = image_bgr[keep_mask]
 
     return out, (black_mask.astype(np.uint8) * 255), (blue_mask.astype(np.uint8) * 255), (keep_mask.astype(np.uint8) * 255)
+
+def build_grid_line_mask(image_bgr):
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    _, gray_inv = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    h, w = gray.shape[:2]
+    h_lines = cv2.morphologyEx(
+        gray_inv,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w // 15), 1)),
+    )
+    v_lines = cv2.morphologyEx(
+        gray_inv,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h // 15))),
+    )
+    grid_mask = cv2.add(h_lines, v_lines)
+    _, grid_mask_bin = cv2.threshold(grid_mask, 10, 255, cv2.THRESH_BINARY)
+    return grid_mask_bin
+
+def inpaint_grid_intersections(bgr_image, grid_mask):
+    """
+    Reconstruct thin curve fragments across removed grid-line locations.
+    Uses an adaptive radius based on grid thickness.
+    """
+    if grid_mask is None or np.count_nonzero(grid_mask) == 0:
+        return bgr_image
+
+    dist = cv2.distanceTransform(grid_mask, cv2.DIST_L2, 3)
+    if dist.max() > 0:
+        radius = int(np.percentile(dist[dist > 0], 80) * 1.5) + 2
+        radius = max(4, min(radius, 10))
+    else:
+        radius = 5
+
+    print(f"[boxRemoval] inpaint radius = {radius}")
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated_mask = cv2.dilate(grid_mask, kernel, iterations=1)
+    inpainted = cv2.inpaint(bgr_image, dilated_mask, radius, cv2.INPAINT_TELEA)
+
+    gray = cv2.cvtColor(inpainted, cv2.COLOR_BGR2GRAY)
+    _, bin_img = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    closed_h = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, h_kernel, iterations=1)
+    closed_v = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, v_kernel, iterations=1)
+    merged = cv2.bitwise_or(closed_h, closed_v)
+    gap_region = cv2.bitwise_and(merged, dilated_mask)
+
+    result = inpainted.copy()
+    result[gap_region > 0] = 0
+    return result
 
 def process_one_image(image_input, output_root=None, image_name=None):
     is_array_input = isinstance(image_input, np.ndarray)
@@ -499,6 +561,10 @@ def process_one_image(image_input, output_root=None, image_name=None):
 
     else:
         result = cv2.inpaint(after_thin, combined_mask, SMALL_OBJ_INPAINT_R, cv2.INPAINT_TELEA)
+
+    if RECONSTRUCT_GRID_INTERSECTIONS:
+        grid_mask = cv2.bitwise_or(build_grid_line_mask(step0_img), box_mask)
+        result = inpaint_grid_intersections(result, grid_mask)
 
     if image_out_dir is not None:
         cv2.imwrite(str(image_out_dir / 'step4_after_small_object_removal.png'), result)

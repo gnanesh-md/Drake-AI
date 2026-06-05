@@ -6,9 +6,7 @@ const GraphLoadingSpinner = () => (
   <div className="graph-loading-spinner" aria-label="Loading">
     <div className="oil-loader">
       <div className="oil-loader-ring" />
-      <div className="oil-loader-reveal">
-        <object data={oilfieldLoading} type="image/svg+xml" aria-label="Loading animation" className="oil-loader-image" />
-      </div>
+      <object data={oilfieldLoading} type="image/svg+xml" aria-label="Loading animation" className="oil-loader-image" />
     </div>
   </div>
 );

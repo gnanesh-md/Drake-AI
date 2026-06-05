@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "axios": "^1.7.7",
+    "docx": "^9.7.1",
     "geotiff": "^2.1.3",
+    "jspdf": "^4.2.1",
     "las": "^3.0.7",
     "las-js": "^3.4.2",
     "potree": "^0.1.0",
@@ -22,7 +24,8 @@
     "react-router-dom": "^6.26.2",
     "react-tiff": "^0.0.11",
     "tiff": "^6.2.0",
-    "tiff.js": "^1.0.0"
+    "tiff.js": "^1.0.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
