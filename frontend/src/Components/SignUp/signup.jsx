@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import axios from "axios";
 import { FaEye, FaEyeSlash } from "react-icons/fa";
 import { NODE_API } from "../../config/constants";
@@ -86,7 +86,7 @@ export function SignUp() {
             <div className="flex flex-col items-center pl-12 w-full text-black max-md:pl-5 max-md:max-w-full">
               <div className="flex gap-1 self-end">
                 <div className="grow font-light">have an account?</div>
-                <a href="/login" className="font-medium">Sign in!</a>
+                <Link to="/login" className="font-medium">Sign in!</Link>
               </div>
               <div className="mt-14 ml-12 text-2xl font-semibold leading-10 max-md:mt-10 max-md:ml-2.5">
                 Get Started With Well Log Digitization

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 import { useState } from 'react';
 import { AiOutlineEye, AiOutlineEyeInvisible } from "react-icons/ai";
 import GraphLogo from "../../assets/login-graph.png"
@@ -52,7 +53,7 @@ export function Login() {
                 Well Log Digitization</div>
               <div className="flex gap-2 my-auto text-sm leading-none">
                 <div className="grow font-light">Don’t have an account?</div>
-                <a href="/signup" className="font-medium">Sign up!</a>
+                <Link to="/signup" className="font-medium">Sign up!</Link>
               </div>
             </div>
             <div className="flex flex-col mt-24 ml-20 max-w-full w-[402px] max-md:mt-10 max-md:ml-2.5">
@@ -129,9 +130,9 @@ export function Login() {
                     <input type="checkbox" className="mr-2" />
                     Remember me
                   </label>
-                  <a href="/forgot-password" className="text-sm font-light leading-none text-neutral-800">
+                  <Link to="/forgot-password" className="text-sm font-light leading-none text-neutral-800">
                     Forgot Password ?
-                  </a>
+                  </Link>
                 </div>
                 <button
                   type="submit"

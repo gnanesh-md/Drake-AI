@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 
 export function SectionHero() {
   return (
@@ -29,11 +30,11 @@ export function SectionHero() {
         {/* Buttons with gradient border */}
         <div className="flex flex-wrap gap-10 mb-[6rem] items-center justify-center mt-11 w-full max-w-screen-xl text-base font-semibold leading-none bg-blend-normal min-h-[52px] max-md:pl-5 max-md:max-w-full">
           {/* Book a Demo with border gradient */}
-          <a href="/login" className="relative p-[2px] rounded-[160px] bg-gradient-to-r from-[#9B51E0] to-[#5D8fEc]">
+          <Link to="/login" className="relative p-[2px] rounded-[160px] bg-gradient-to-r from-[#9B51E0] to-[#5D8fEc]">
             <div className="px-5 py-3.5 bg-neutral-900 rounded-[160px] text-white max-md:px-5 hover:bg-[#1B1724]">
               Register Now
             </div>
-          </a>
+          </Link>
           {/* Contact Us with border gradient */}
           {/* <div className="relative p-[2px] rounded-[160px] bg-gradient-to-r from-[#9B51E0] to-[#5D8fEc]">
             <div className="px-5 py-3.5 bg-neutral-900 rounded-[160px] text-white max-md:px-5 hover:bg-[#1B1724]">

@@ -19,7 +19,7 @@ This repository contains a React frontend, a Node/Express backend, and a Python/
 
 ## Current frontend behavior
 
-The current main screen is [frontend/src/Components/Dashboard/display5.jsx](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/frontend/src/Components/Dashboard/display5.jsx).
+The current main screen is `frontend/src/Components/Dashboard/display5.jsx`.
 
 That flow currently:
 
@@ -29,7 +29,7 @@ That flow currently:
 - lets you adjust points and graph boundaries
 - exports LAS files through the Python LAS endpoint
 
-Auth and account flows use the Node backend through [frontend/src/config/constants.tsx](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/frontend/src/config/constants.tsx).
+Auth and account flows use the Node backend through `frontend/src/config/constants.tsx`.
 
 ## Runtime configuration
 
@@ -39,7 +39,7 @@ The frontend now reads service URLs from env with hosted fallbacks:
 - `VITE_GRAPH_API_URL` -> defaults to `https://python-curvetracking.thedrake.ai/segment-and-graph`
 - `VITE_GRAPH_LAS` or legacy `VITE_GRAPH_Las` -> defaults to `https://python-curvetracking.thedrake.ai/generate-las-base64`
 
-The checked-in [frontend/.env](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/frontend/.env) currently sets:
+The checked-in `frontend/.env` currently sets:
 
 ```env
 VITE_GRAPH_API_URL=https://python-curvetracking.thedrake.ai/segment-and-graph
@@ -80,7 +80,7 @@ PORT=5000
 Notes:
 
 - MongoDB falls back to `mongodb://localhost:27017/graphocr`
-- CORS is now env-driven in [js-backend/app.js](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/js-backend/app.js)
+- CORS is now env-driven in `js-backend/app.js`
 - `PYTHON_SERVICE_URL` is only used by `POST /api/decode-las`
 - the frontend’s local Node example points to port `5000`
 
@@ -95,11 +95,17 @@ TIFF_CHUNK_MODEL_PATH=best.pt
 
 Notes:
 
-- `GEMNI_KEY` is intentionally spelled that way because [python-multiline/main.py](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/python-multiline/main.py) reads that exact env var
+- `GEMNI_KEY` is intentionally spelled that way because `python-multiline/main.py` reads that exact env var
 - `TIFF_CHUNK_MODEL_PATH` falls back to `python-multiline/best.pt` when unset
 - the Python service also uses EasyOCR locally
 
 ## Run the stack locally
+
+Before sharing or deploying this version:
+
+- Keep all Python runtime dependencies in `python-multiline/requirements.txt`.
+- Use `.venv` to manage the Python environment locally.
+- Verify the same application version you are sharing works locally before deployment.
 
 ### 1. Start MongoDB
 
@@ -141,6 +147,8 @@ Important note:
 
 ```bash
 cd python-multiline
+python -m venv ../.venv
+. ../.venv/bin/activate
 pip install -r requirements.txt
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -185,7 +193,7 @@ cd frontend && npm run dev
 
 ## Other codebase notes
 
-- [frontend/vite.config.js](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/frontend/vite.config.js) still contains older proxy entries pointing at hosted services
-- [python-multiline/main.py](/home/haziq/Desktop/Projects/4-proj-GraphOCR/Final_frontend_updated_Done/python-multiline/main.py) is the current Python entry point
+- `frontend/vite.config.js` still contains older proxy entries pointing at hosted services
+- `python-multiline/main.py` is the current Python entry point
 - files in `python-multiline/versions/` are older variants, not the main runtime path
 - auth pages and project/image upload features still depend on the Node backend even though the main `/dashboard` curve extraction flow talks directly to Python

@@ -1,12 +1,13 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 
 export function NavigationBar() {
   return (
     <div className="flex justify-between items-center px-20 py-3 text-base leading-none bg-blend-normal bg-neutral-900 max-md:px-5">
       {/* Logo Section */}
-      <a href="/" className="text-3xl font-bold tracking-widest leading-none uppercase bg-clip-text bg-gradient-to-r from-[#9B51E0] to-[#3081ED] text-transparent white">
+      <Link to="/" className="text-3xl font-bold tracking-widest leading-none uppercase bg-clip-text bg-gradient-to-r from-[#9B51E0] to-[#3081ED] text-transparent white">
         Well Log Digitization
-      </a>
+      </Link>
 
       {/* Center Links */}
       <div className="flex gap-10 text-white font-medium">
@@ -24,12 +25,12 @@ export function NavigationBar() {
 
       {/* Right Section: Sign In & Book a Demo */}
       <div className="flex gap-5 items-center">
-        {/* <a href="/login" className="font-medium text-white cursor-pointer">Sign In</a> */}
-        <a href="/login" className="relative p-[2px] rounded-[160px] bg-gradient-to-r from-[#9B51E0] to-[#5D8fEc]">
+        {/* <Link to="/login" className="font-medium text-white cursor-pointer">Sign In</Link> */}
+        <Link to="/login" className="relative p-[2px] rounded-[160px] bg-gradient-to-r from-[#9B51E0] to-[#5D8fEc]">
           <div className="px-8 py-3.5 font-semibold text-white bg-neutral-900 rounded-[160px] hover:bg-[#1B1724] whitespace-nowrap">
             Sign In
           </div>
-        </a>
+        </Link>
       </div>
     </div>
   );

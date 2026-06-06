@@ -44,7 +44,7 @@ I've implemented a complete **automatic curve-to-value matching system** that so
 
 ### Option 1: Quick Test (Recommended)
 ```bash
-cd /home/kalpra/Desktop/Drake-AI/python-multiline
+cd python-multiline
 
 # Run with your graph image
 python test_curve_matcher.py path/to/your_graph.png

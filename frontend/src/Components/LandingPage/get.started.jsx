@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 
 export function GetStarted() {
   return (
@@ -15,7 +16,7 @@ export function GetStarted() {
             actionable insights.
           </div>
           <div className="flex gap-2 text-2xl mt-10 leading-none max-md:mt-[2rem]">
-            <a href="/login" className="text-indigo-400">Get Started</a>
+            <Link to="/login" className="text-indigo-400">Get Started</Link>
             <img
               loading="lazy"
               srcSet="https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=100 100w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=200 200w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=400 400w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=800 800w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=1200 1200w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=1600 1600w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&width=2000 2000w, https://cdn.builder.io/api/v1/image/assets/TEMP/d22153d2fedae1d17dbc0e57bc87380407d5cf9a15c9d2f92c696fb45e1b3918?apiKey=1d485f9dde7143abb922c2dffce25120&"

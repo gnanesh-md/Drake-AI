@@ -5,7 +5,6 @@ import oilfieldLoading from '../../assets/oil_refinery_loading_animation.svg';
 const GraphLoadingSpinner = () => (
   <div className="graph-loading-spinner" aria-label="Loading">
     <div className="oil-loader">
-      <div className="oil-loader-ring" />
       <object data={oilfieldLoading} type="image/svg+xml" aria-label="Loading animation" className="oil-loader-image" />
     </div>
   </div>

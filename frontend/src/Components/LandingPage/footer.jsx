@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 
 export function Footer() {
   return (
@@ -18,7 +19,7 @@ export function Footer() {
             <div className="self-stretch text-xl font-bold text-white">
               Company
             </div>
-            <a href="/" className="mt-6">Home</a>
+            <Link to="/" className="mt-6">Home</Link>
             <div className="mt-6">About Us</div>
             <div className="mt-6">Careers</div>
             <div className="mt-6">Press</div>

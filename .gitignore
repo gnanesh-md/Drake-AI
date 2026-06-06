@@ -1,0 +1,56 @@
+# ═══════════════════════════════════════════════
+# Drake-AI .gitignore
+# ═══════════════════════════════════════════════
+
+# ── Dependencies ──────────────────────────────
+node_modules/
+
+# ── Python Virtual Environments ───────────────
+.venv/
+venv/
+env/
+
+# ── Python Cache / Compiled ───────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── Build Output ──────────────────────────────
+dist/
+build/
+.vite/
+
+# ── Environment / Secrets ─────────────────────
+.env
+*.env.local
+
+# ── Runtime / Generated Data ──────────────────
+_runtime/
+_preview/
+output/
+logs/
+uploads/
+*.log
+
+# ── Binary / Large Files ─────────────────────
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# ── OS Files ──────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE / Editor ──────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── AI Agent Directories ─────────────────────
+.codex/
+.agents/

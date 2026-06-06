@@ -199,7 +199,7 @@ class CurveValueMatcher:
                 min_value, max_value = max_value, min_value
             
             return (float(round(min_value, 3)), float(round(max_value, 3)))
-        
+            
         return (float(value_first), float(value_last))
 
     def match_curves_to_values(

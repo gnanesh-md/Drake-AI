@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 
 export function HeroSection() {
   return (
@@ -16,10 +17,10 @@ export function HeroSection() {
           <div className="basis-auto text-stone-300">how it works</div> */}
         </div>
         <div className="flex gap-8 self-stretch text-stone-300">
-          <a href="/login" className="px-9 py-3 whitespace-nowrap rounded-xl border border-solid border-zinc-300 max-md:px-5">
+          <Link to="/login" className="px-9 py-3 whitespace-nowrap rounded-xl border border-solid border-zinc-300 max-md:px-5">
             Sign In
-          </a>
-          {/* <a href="/login" className="my-auto">sign in</a> */}
+          </Link>
+          {/* <Link to="/login" className="my-auto">sign in</Link> */}
         </div>
       </div>
       <div className="mt-44 max-md:mt-10 max-md:max-w-full">
@@ -47,9 +48,9 @@ export function HeroSection() {
         </div>
       </div>
       <div className="flex gap-5 max-w-full text-2xl tracking-tighter whitespace-nowrap w-[476px]">
-        <a href="/login" className="gap-2.5 self-stretch px-6 py-3 font-semibold text-white rounded-2xl max-md:px-5 bg-gradient-to-r from-[#9B51E0] to-[#3081ED]">
+        <Link to="/login" className="gap-2.5 self-stretch px-6 py-3 font-semibold text-white rounded-2xl max-md:px-5 bg-gradient-to-r from-[#9B51E0] to-[#3081ED]">
           Sign In
-        </a>
+        </Link>
         {/* <div className="gap-2.5 self-stretch px-6 py-3 rounded-2xl border border-solid border-zinc-300 text-zinc-300 max-md:px-5">
           Create
         </div> */}

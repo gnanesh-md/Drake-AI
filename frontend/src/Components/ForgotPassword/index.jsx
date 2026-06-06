@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Link } from "react-router-dom";
 import axios from "axios";
 import { AiOutlineEye, AiOutlineEyeInvisible } from "react-icons/ai";
 import { NODE_API } from "../../config/constants";
@@ -108,9 +109,9 @@ export function ForgotPassword() {
             <div className="flex flex-col items-center pl-12 w-full text-black max-md:pl-5 max-md:max-w-full">
               <div className="flex gap-1 self-end">
                 <div className="grow font-light">have an account?</div>
-                <a href="/login" className="font-medium">
+                <Link to="/login" className="font-medium">
                   Sign in!
-                </a>
+                </Link>
               </div>
               <div className="w-full rounded-lg sm:max-w-md xl:p-0 mt-[13rem]">
                     <div className="p-6 space-y-4 md:space-y-6 sm:p-8">

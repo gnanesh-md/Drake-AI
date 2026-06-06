@@ -20,3 +20,6 @@ pydantic==2.9.2
 easyocr==1.7.1
 google-genai
 ollama
+matplotlib==3.10.9
+seaborn==0.13.2
+tqdm==4.67.3
